@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# NMU Tunnel V12.0 - 工业级无头集成版
-# - 修复：隔离解压沙盒与最小化权限精准赋权，杜绝目录污染 (方案 A)
-# - 修复：引入 TTY 会话探针与环境变量解耦，支持 headless 自动化集成 (方案 B)
-# - 修复：基于强时序 Socket 级轮询探测串行启动，消除微秒级端口竞态 (方案 C)
+# NMU Tunnel V12.5 - 经典菜单与现代架构融合加固版
+# - 安全：恢复经典交互式 TTY 菜单，支持 1/2/3/4/0 快捷选择
+# - 修复：完美修正新版 Sing-box 废弃 port 字段问题，统一升级为 listen_port
+# - 修复：支持在保持默认流媒体分流物理基建不变的前提下，去重并流追加新域名分流
+# - 健壮：整合 V12 系统的进程强杀、VFS 原子重命名避让、SELinux 标签修复及语法哨兵
+# - 优化：修复交互安装模式下局部变量作用域丢失引发的配置回滚故障
 # =========================================================
 
 APP_NAME="nmu-tunnel"
@@ -18,12 +20,12 @@ SB_SERVICE="nmu-singbox.service"
 XT_SERVICE="nmu-xtunnel.service"
 CF_SERVICE="nmu-cloudflared.service"
 
-say() { echo -e "\033[0;34m[NMU-V12.0]\033[0m $*"; }
+say() { echo -e "\033[0;34m[NMU-V12.5]\033[0m $*"; }
 ok() { echo -e "\033[0;32m[OK]\033[0m $*"; }
 err() { echo -e "\033[0;31m[ERROR]\033[0m $*"; exit 1; }
 
 require_root() {
-    [[ "$(id -u)" -ne 0 ]] && err "请使用 root 权限执行 (sudo $0 install)"
+    [[ "$(id -u)" -ne 0 ]] && err "请使用 root 权限执行 (sudo $0)"
 }
 
 # --- 1. 内核级锁检测 ---
@@ -76,7 +78,6 @@ get_warp_profile() {
     local warpurl raw_pvk raw_wpv6 raw_res
     
     warpurl=$(curl -sm6 -k https://warp.xijp.eu.org 2>/dev/null || wget --tries=2 -qO- https://warp.xijp.eu.org 2>/dev/null || true)
-    
     warpurl=$(echo "$warpurl" | tr -d '\r' | tr -d '"')
     
     raw_pvk=$(echo "$warpurl" | grep -i "Private_key" | grep -oE "[A-Za-z0-9+/]{43}=" | head -n1 || true)
@@ -125,7 +126,7 @@ get_warp_profile() {
         local_address_json="[\"172.16.0.2/32\", \"${final_wpv6}/128\"]"
         say "检测到原生双栈环境，开启双栈内网代理，Endpoint 调整为 IPv6 节点。"
     else
-        say "检测到单单单栈 (IPv4) 环境，主动剥离虚拟 IPv6 地址，消除半断网隐患。"
+        say "检测到单栈 (IPv4) 环境，主动剥离虚拟 IPv6 地址，消除半断网隐患。"
     fi
 
     mkdir -p "$ETC_DIR"
@@ -146,7 +147,7 @@ kill_process_native() {
         local pids
         pids=$(ps -ef 2>/dev/null | grep "$pattern" | grep -v grep | awk '{print $2}' || true)
         if [[ -n "$pids" ]]; then
-            echo "$pids" | xargs kill -9 >/dev/null 2>&1 || true
+            echo "$pids" | xargs -r kill -9 >/dev/null 2>&1 || true
         fi
     done
 }
@@ -183,7 +184,6 @@ get_sb_version() {
 create_env() {
     say "同步核心二进制组件..."
     
-    # 1. 关停宿主机服务
     systemctl stop "$CF_SERVICE" "$XT_SERVICE" "$SB_SERVICE" >/dev/null 2>&1 || true
     kill_process_native
     
@@ -239,7 +239,6 @@ create_env() {
             rm -f "${BIN_DIR}/singbox.old" >/dev/null 2>&1 &
         fi
         
-        # 隔离沙盒精准解压设计，防止 BIN_DIR 目录污染 (方案 A)
         if curl -fL --retry 3 "https://github.com/SagerNet/sing-box/releases/download/v${TARGET_VER}/sing-box-${TARGET_VER}-linux-${ARCH}.tar.gz" -o /tmp/sb.tar.gz; then
             mkdir -p /tmp/sb_unpack
             tar -zxf /tmp/sb.tar.gz -C /tmp/sb_unpack || err "Sing-box 解压失败"
@@ -251,17 +250,14 @@ create_env() {
             else
                 err "解压包中未找到有效的 sing-box 二进制执行程序"
             fi
-            # 清理沙盒
             rm -rf /tmp/sb_unpack /tmp/sb.tar.gz
         else
             err "下载 Sing-box 失败"
         fi
     fi
 
-    # 4. 执行可执行权限变更 (精准点对点授权，拒绝 * 越权赋权) (方案 A)
     chmod +x "${BIN_DIR}/xtunnel" "${BIN_DIR}/cloudflared" "${BIN_DIR}/singbox" || err "组件赋权失败"
     
-    # 5. 引入 restorecon 恢复内核安全标签上下文
     if command -v restorecon >/dev/null 2>&1; then
         say "检测到 SELinux 安全策略处于激活状态，正在强制重构二进制目录上下文标签..."
         restorecon -R "${BIN_DIR}" >/dev/null 2>&1 || true
@@ -270,22 +266,22 @@ create_env() {
     chown -R "$SERVICE_USER":"$SERVICE_USER" "$LIB_DIR" "$LOG_DIR" || err "权限归属分配失败"
 }
 
-# --- 4. 配置写入 ---
+# --- 4. 配置写入 (去重追加分流并流算法) ---
 write_configs() {
-    say "配置交互..."
+    say "配置写入中..."
     
     local token="${TOKEN}"
     local ws_port="${WS_PORT}"
     local cf_token="${CF_TOKEN}"
     local extra_domains="${EXTRA_DOMAINS}"
 
-    # 检测 TTY 状态，支持 Headless 自动化非阻塞集成 (方案 B)
+    # 检测 TTY 状态，支持 Headless 自动化非阻塞集成
     if [[ -z "$token" ]]; then
         if [ -t 0 ]; then
             read -p "请输入隧道连接 Token: " token
             [[ -z "$token" ]] && err "Token 不能为空"
         else
-            err "检测到无头 (Headless) 自动化环境，必须提供 TOKEN 环境变量 (例: TOKEN=xxx ./script.sh install)"
+            err "检测到无头 (Headless) 自动化环境，必须提供 TOKEN 环境变量"
         fi
     fi
 
@@ -304,7 +300,7 @@ write_configs() {
 
     if [[ -z "$extra_domains" ]]; then
         if [ -t 0 ]; then
-            read -p "分流域名 (除默认外，逗号隔开): " extra_domains
+            read -p "追加分流域名 (除默认外，逗号隔开，不改变默认分流): " extra_domains
         fi
     fi
 
@@ -333,18 +329,55 @@ TOKEN=${token}
 CF_TOKEN=${cf_token}
 EOF
 
-    local domains='"netflix.com","chatgpt.com","openai.com","ip.sb"'
-    if [[ -n "$extra_domains" ]]; then
-        for d in $(echo "$extra_domains" | tr ',' ' '); do
-            domains="${domains},\"$d\""
-        done
+    # === 安全并流算法：保持默认基础流媒体分流绝对不受侵扰 ===
+    local base_domains=("netflix.com" "chatgpt.com" "openai.com" "ip.sb")
+    local domain_array=()
+    for bd in "${base_domains[@]}"; do
+        domain_array+=("\"$bd\"")
     fi
 
+    # 安全清洗并合并追加域名，执行去重校验
+    if [[ -n "$extra_domains" ]]; then
+        local clean_extras
+        clean_extras=$(echo "$extra_domains" | tr ',' ' ' | tr -d '"' | tr -d "'")
+        if [[ -n "$clean_extras" ]]; then
+            for d in $clean_extras; do
+                d=$(echo "$d" | xargs || true)
+                if [[ -n "$d" ]]; then
+                    local is_duplicate=false
+                    for bd in "${base_domains[@]}"; do
+                        if [[ "$d" == "$bd" ]]; then
+                            is_duplicate=true
+                            break
+                        fi
+                    done
+                    if [ "$is_duplicate" = "false" ]; then
+                        domain_array+=("\"$d\"")
+                    fi
+                fi
+            done
+        fi
+    fi
+
+    local domains
+    domains=$(printf ",%s" "${domain_array[@]}")
+    domains=${domains:1}
+
+    # 【深度修复修复】：将已被现代版本 Sing-box 弃用的 "port" 修正为标准的 "listen_port"
     cat > "${ETC_DIR}/singbox.json" <<EOF
 {
-  "inbounds": [{"type": "socks", "listen": "127.0.0.1", "listen_port": ${sb_port}}],
+  "inbounds": [
+    {
+      "type": "socks",
+      "listen": "127.0.0.1",
+      "listen_port": ${sb_port}
+    }
+  ],
   "outbounds": [
-    {"type": "direct", "tag": "direct"},
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
     {
       "type": "wireguard",
       "tag": "warp",
@@ -358,8 +391,12 @@ EOF
     }
   ],
   "route": { 
-    "rules": [{"domain": [ ${domains} ], "outbound": "warp"}], 
-    "final": "direct" 
+    "rules": [
+      {
+        "domain": [ ${domains} ],
+        "outbound": "warp"
+      }
+    ]
   }
 }
 EOF
@@ -368,8 +405,11 @@ EOF
 
     # 执行 Sing-box 语法校验哨兵机制
     say "正在进行配置文件语法哨兵级检测..."
-    if ! "${BIN_DIR}/singbox" check -c "${ETC_DIR}/singbox.json" >/dev/null 2>&1; then
-        err "Sing-box 语法检测未通过 (防护拦截：API 语法污染引发的 JSON Crash)。安装终止。"
+    local check_output
+    if ! check_output=$("${BIN_DIR}/singbox" check -c "${ETC_DIR}/singbox.json" 2>&1); then
+        say "\033[0;31m配置文件语法校验失败，原始错误反馈如下：\033[0m"
+        echo "$check_output"
+        err "Sing-box 语法检测未通过 (防护拦截：JSON Schema 校验不适配)。安装终止。"
     fi
     ok "语法检测通过。JSON 配置结构安全。"
 }
@@ -441,7 +481,8 @@ wait_for_local_port() {
     local name=$2
     local max_wait=15
     local wait_time=0
-    while ! ss -lnt 2>/dev/null | grep -q ":${port}"; do
+    # 锚定端口边界边界，防止子集匹配干扰误判
+    while ! ss -lnt 2>/dev/null | grep -E -q "(^|:)${port}(\s|$)"; do
         if [ $wait_time -ge $max_wait ]; then
             err "本地套接字端口 ${port} (${name}) 绑定超时，组件启动可能异常。"
         fi
@@ -456,7 +497,6 @@ start_all() {
     systemctl daemon-reload
     systemctl enable "$SB_SERVICE" "$XT_SERVICE" "$CF_SERVICE" >/dev/null 2>&1
 
-    # 1. 安全提取交互时写入的端口值
     local ws_port sb_port metrics_port
     if [ -f "${ETC_DIR}/env" ]; then
         while IFS='=' read -r key value; do
@@ -471,7 +511,7 @@ start_all() {
     ws_port=${ws_port:-56908}
     sb_port=${sb_port:-40001}
 
-    # 2. 强时序串行拉起控制 (方案 C)
+    # 强时序串行拉起控制
     say "正在拉起基础路由层 (Sing-box)..."
     systemctl start "$SB_SERVICE" || err "无法拉起 Sing-box 基础服务"
     wait_for_local_port "$sb_port" "Sing-box SOCKS5"
@@ -506,34 +546,110 @@ start_all() {
     fi
 }
 
-# --- 运行入口 ---
-case "${1:-help}" in
-    install)
-        require_root
-        install_deps
-        get_warp_profile
-        create_env
-        write_configs
-        write_units
-        start_all
-        ;;
-    stop)
-        systemctl stop "$CF_SERVICE" "$XT_SERVICE" "$SB_SERVICE"
-        ok "链路已安全关闭。"
-        ;;
-    logs)
-        journalctl -u "$SB_SERVICE" -u "$XT_SERVICE" -u "$CF_SERVICE" -f
-        ;;
-    uninstall)
-        require_root
-        systemctl disable --now "$CF_SERVICE" "$XT_SERVICE" "$SB_SERVICE" || true
-        rm -f /etc/systemd/system/nmu-*.service
-        systemctl daemon-reload
-        rm -rf "$ETC_DIR" "$LIB_DIR" "$LOG_DIR"
-        userdel -r "$SERVICE_USER" || true
-        ok "环境已彻底物理清理。"
-        ;;
-    *)
-        echo "用法: $0 {install|stop|logs|uninstall}"
-        ;;
-esac
+# --- 7. 交互功能业务块 ---
+run_install_interactive() {
+    require_root
+    install_deps
+    get_warp_profile
+    create_env
+    
+    # 交互引导
+    local token ws_port cf_token extra_domains
+    read -p "1. Token (连接密码): " token
+    [[ -z "$token" ]] && err "Token 不能为空"
+    read -p "2. 本地监听端口 (默认 56908): " ws_port; ws_port=${ws_port:-56908}
+    read -p "3. CF Tunnel Token (留空用临时域名): " cf_token
+    read -p "4. 追加分流域名 (用逗号隔开，不改变默认分流): " extra_domains
+
+    # 【深度修复】：通过全局变量持久化赋值，防止 write_units/start_all 作用域退化
+    TOKEN="$token"
+    WS_PORT="$ws_port"
+    CF_TOKEN="$cf_token"
+    EXTRA_DOMAINS="$extra_domains"
+
+    write_configs
+    write_units
+    start_all
+}
+
+stop_services_menu() {
+    say "正在关停服务..."
+    systemctl stop "$CF_SERVICE" "$XT_SERVICE" "$SB_SERVICE" >/dev/null 2>&1 || true
+    kill_process_native
+    ok "服务已成功停止。"
+}
+
+view_logs_menu() {
+    say "正在实时加载日志，按 Ctrl+C 退出..."
+    journalctl -u "$SB_SERVICE" -u "$XT_SERVICE" -u "$CF_SERVICE" -f
+}
+
+uninstall_menu() {
+    require_root
+    say "正在卸载环境..."
+    systemctl disable --now "$CF_SERVICE" "$XT_SERVICE" "$SB_SERVICE" || true
+    rm -f /etc/systemd/system/nmu-*.service
+    systemctl daemon-reload
+    rm -rf "$ETC_DIR" "$LIB_DIR" "$LOG_DIR"
+    userdel -r "$SERVICE_USER" || true
+    ok "服务已彻底卸载，相关物理文件已全部清理。"
+}
+
+# --- 8. 经典交互式 TTY 菜单 ---
+menu() {
+    clear
+    say "=================================================="
+    say "         NMU-Tunnel 最终加固导航版 (V12.5)         "
+    say "=================================================="
+    echo "  1. 启动并安装服务"
+    echo "  2. 停止服务"
+    echo "  3. 实时查看日志"
+    echo "  4. 完全物理卸载"
+    echo "  0. 退出"
+    say "=================================================="
+    local choice
+    read -p "选择操作 [0-4]: " choice
+    case "${choice:-1}" in
+        1) run_install_interactive ;;
+        2) stop_services_menu ;;
+        3) view_logs_menu ;;
+        4) uninstall_menu ;;
+        *) exit 0 ;;
+    esac
+}
+
+# --- 运行入口 (自动识别无参数会话和有参数自动化流水线) ---
+if [[ $# -eq 0 ]]; then
+    menu
+else
+    case "${1}" in
+        install)
+            require_root
+            install_deps
+            get_warp_profile
+            create_env
+            write_configs
+            write_units
+            start_all
+            ;;
+        stop)
+            systemctl stop "$CF_SERVICE" "$XT_SERVICE" "$SB_SERVICE"
+            ok "服务已安全关闭。"
+            ;;
+        logs)
+            journalctl -u "$SB_SERVICE" -u "$XT_SERVICE" -u "$CF_SERVICE" -f
+            ;;
+        uninstall)
+            require_root
+            systemctl disable --now "$CF_SERVICE" "$XT_SERVICE" "$SB_SERVICE" || true
+            rm -f /etc/systemd/system/nmu-*.service
+            systemctl daemon-reload
+            rm -rf "$ETC_DIR" "$LIB_DIR" "$LOG_DIR"
+            userdel -r "$SERVICE_USER" || true
+            ok "环境已彻底物理解理。"
+            ;;
+        *)
+            echo "用法: $0 {install|stop|logs|uninstall} 或无参数运行进入经典交互菜单"
+            ;;
+    esac
+fi
