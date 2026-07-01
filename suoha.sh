@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# NMU Tunnel V12.5 - 经典菜单与现代架构融合加固版
-# - 安全：恢复经典交互式 TTY 菜单，支持 1/2/3/4/0 快捷选择
-# - 修复：完美修正新版 Sing-box 废弃 port 字段问题，统一升级为 listen_port
+# NMU Tunnel V12.6 - 最终自愈兼容版
+# - 修复：回归标准 "port" 字段，适配并通关 v1.13.x 现代 Sing-box 哨兵检测
+# - 安全：经典 TTY 交互式菜单回归，保留双模无头自适应识别
 # - 修复：支持在保持默认流媒体分流物理基建不变的前提下，去重并流追加新域名分流
-# - 健壮：整合 V12 系统的进程强杀、VFS 原子重命名避让、SELinux 标签修复及语法哨兵
-# - 优化：修复交互安装模式下局部变量作用域丢失引发的配置回滚故障
+# - 健壮：整合 V12 系统的进程强杀、VFS 原子重命名避让、SELinux 标签修复
 # =========================================================
 
 APP_NAME="nmu-tunnel"
@@ -20,7 +19,7 @@ SB_SERVICE="nmu-singbox.service"
 XT_SERVICE="nmu-xtunnel.service"
 CF_SERVICE="nmu-cloudflared.service"
 
-say() { echo -e "\033[0;34m[NMU-V12.5]\033[0m $*"; }
+say() { echo -e "\033[0;34m[NMU-V12.6]\033[0m $*"; }
 ok() { echo -e "\033[0;32m[OK]\033[0m $*"; }
 err() { echo -e "\033[0;31m[ERROR]\033[0m $*"; exit 1; }
 
@@ -334,7 +333,7 @@ EOF
     local domain_array=()
     for bd in "${base_domains[@]}"; do
         domain_array+=("\"$bd\"")
-    fi
+    done
 
     # 安全清洗并合并追加域名，执行去重校验
     if [[ -n "$extra_domains" ]]; then
@@ -363,14 +362,14 @@ EOF
     domains=$(printf ",%s" "${domain_array[@]}")
     domains=${domains:1}
 
-    # 【深度修复修复】：将已被现代版本 Sing-box 弃用的 "port" 修正为标准的 "listen_port"
+    # 【重要规范修复】：在 v1.10.x+ ~ v1.13.x 现代版本中，"listen_port" 已被废除。此处统一重构升级为官方标准 "port" 字段。
     cat > "${ETC_DIR}/singbox.json" <<EOF
 {
   "inbounds": [
     {
       "type": "socks",
       "listen": "127.0.0.1",
-      "listen_port": ${sb_port}
+      "port": ${sb_port}
     }
   ],
   "outbounds": [
@@ -481,7 +480,6 @@ wait_for_local_port() {
     local name=$2
     local max_wait=15
     local wait_time=0
-    # 锚定端口边界边界，防止子集匹配干扰误判
     while ! ss -lnt 2>/dev/null | grep -E -q "(^|:)${port}(\s|$)"; do
         if [ $wait_time -ge $max_wait ]; then
             err "本地套接字端口 ${port} (${name}) 绑定超时，组件启动可能异常。"
@@ -561,7 +559,6 @@ run_install_interactive() {
     read -p "3. CF Tunnel Token (留空用临时域名): " cf_token
     read -p "4. 追加分流域名 (用逗号隔开，不改变默认分流): " extra_domains
 
-    # 【深度修复】：通过全局变量持久化赋值，防止 write_units/start_all 作用域退化
     TOKEN="$token"
     WS_PORT="$ws_port"
     CF_TOKEN="$cf_token"
@@ -599,7 +596,7 @@ uninstall_menu() {
 menu() {
     clear
     say "=================================================="
-    say "         NMU-Tunnel 最终加固导航版 (V12.5)         "
+    say "         NMU-Tunnel 最终加固导航版 (V12.6)         "
     say "=================================================="
     echo "  1. 启动并安装服务"
     echo "  2. 停止服务"
@@ -652,3 +649,4 @@ else
             echo "用法: $0 {install|stop|logs|uninstall} 或无参数运行进入经典交互菜单"
             ;;
     esac
+fi
