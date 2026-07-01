@@ -652,4 +652,3 @@ else
             echo "用法: $0 {install|stop|logs|uninstall} 或无参数运行进入经典交互菜单"
             ;;
     esac
-fi
