@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# NMU Tunnel V11.4 - 终极无阻版
-# - 修复：引入 VFS 目录项重命名避让机制，利用 mv 原子重命名解决内核 D 状态 (D-State) 进程物理锁死问题
-# - 修复：动态版本探针，避开 GitHub API 速率限制
-# - 修复：无依赖进程切断引擎
-# - 修复：Wireguard-WARP 单/双栈自适应过滤与语法哨兵检测
+# NMU Tunnel V12.0 - 工业级无头集成版
+# - 修复：隔离解压沙盒与最小化权限精准赋权，杜绝目录污染 (方案 A)
+# - 修复：引入 TTY 会话探针与环境变量解耦，支持 headless 自动化集成 (方案 B)
+# - 修复：基于强时序 Socket 级轮询探测串行启动，消除微秒级端口竞态 (方案 C)
 # =========================================================
 
 APP_NAME="nmu-tunnel"
@@ -19,7 +18,7 @@ SB_SERVICE="nmu-singbox.service"
 XT_SERVICE="nmu-xtunnel.service"
 CF_SERVICE="nmu-cloudflared.service"
 
-say() { echo -e "\033[0;34m[NMU-V11.4]\033[0m $*"; }
+say() { echo -e "\033[0;34m[NMU-V12.0]\033[0m $*"; }
 ok() { echo -e "\033[0;32m[OK]\033[0m $*"; }
 err() { echo -e "\033[0;31m[ERROR]\033[0m $*"; exit 1; }
 
@@ -196,65 +195,118 @@ create_env() {
         ARCH="arm64"
     fi
     
-    # 2. VFS 原子重命名避让机制：移走可能陷入 D 状态或忙锁定的旧文件，开辟全新槽位，后台异步清理旧文件
-    for bin_file in xtunnel cloudflared singbox sing-box; do
-        if [[ -f "${BIN_DIR}/${bin_file}" ]]; then
-            mv -f "${BIN_DIR}/${bin_file}" "${BIN_DIR}/${bin_file}.old" >/dev/null 2>&1 || true
-            rm -f "${BIN_DIR}/${bin_file}.old" >/dev/null 2>&1 &
-        fi
-    done
-    
-    # 3. 采用 /tmp 原子下载机制 + 原子重命名覆盖
+    # --- XTUNNEL 同步 (恒定 VFS 重命名避让) ---
     say "正在同步 xtunnel 核心..."
+    if [[ -f "${BIN_DIR}/xtunnel" ]]; then
+        mv -f "${BIN_DIR}/xtunnel" "${BIN_DIR}/xtunnel.old" >/dev/null 2>&1 || true
+        rm -f "${BIN_DIR}/xtunnel.old" >/dev/null 2>&1 &
+    fi
     curl -fL --retry 3 "https://github.com/nmu-glitch/my-tunnels/releases/download/v1.0.0/x-tunnel-linux-${ARCH}" -o "/tmp/xtunnel" || err "xtunnel 下载失败"
     mv -f "/tmp/xtunnel" "${BIN_DIR}/xtunnel"
     
+    # --- CLOUDFLARED 同步 (恒定 VFS 重命名避让) ---
     say "正在同步 cloudflared 核心..."
+    if [[ -f "${BIN_DIR}/cloudflared" ]]; then
+        mv -f "${BIN_DIR}/cloudflared" "${BIN_DIR}/cloudflared.old" >/dev/null 2>&1 || true
+        rm -f "${BIN_DIR}/cloudflared.old" >/dev/null 2>&1 &
+    fi
     curl -fL --retry 3 "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}" -o "/tmp/cloudflared" || err "cloudflared 下载失败"
     mv -f "/tmp/cloudflared" "${BIN_DIR}/cloudflared"
     
-    # 4. 动态本地版本探针
-    local SB_VER
-    SB_VER=$(get_local_sb_version)
-    if [[ -n "$SB_VER" ]]; then
-        say "检测到本地已存在 Sing-box v${SB_VER}，复用本地版本以避开 GitHub API 速率风控。"
-    else
-        say "未检测到本地版本，正在请求远程 GitHub API 获取最新版本号..."
-        SB_VER=$(get_sb_version)
-        if [[ -z "$SB_VER" ]]; then
-            SB_VER="1.8.11"
-            say "GitHub API 响应超限，启用安全备用版本: v${SB_VER}"
-        else
-            say "获取到最新 Sing-box 版本: v${SB_VER}"
-        fi
-    fi
+    # --- SING-BOX 确定版本与按需避让 ---
+    local LOCAL_VER TARGET_VER
+    LOCAL_VER=$(get_local_sb_version)
     
-    # 5. 如果本地版本不一致或不存在，执行拉取覆盖
-    if [[ ! -x "${BIN_DIR}/singbox" ]] || [[ "$SB_VER" != "$(get_local_sb_version)" ]]; then
-        say "正在下载安装 Sing-box v${SB_VER}..."
-        if curl -fL --retry 3 "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${ARCH}.tar.gz" -o /tmp/sb.tar.gz; then
-            tar -zxf /tmp/sb.tar.gz --strip-components=1 -C "${BIN_DIR}" || err "Sing-box 解压失败"
-            if [[ -f "${BIN_DIR}/sing-box" ]]; then
-                mv -f "${BIN_DIR}/sing-box" "${BIN_DIR}/singbox"
+    if [[ -n "$LOCAL_VER" ]]; then
+        TARGET_VER=$(get_sb_version)
+        [[ -z "$TARGET_VER" ]] && TARGET_VER="$LOCAL_VER"
+    else
+        say "未检测到本地已存组件，正在向 GitHub 检索 Sing-box 最新发行版..."
+        TARGET_VER=$(get_sb_version)
+        [[ -z "$TARGET_VER" ]] && TARGET_VER="1.8.11"
+    fi
+
+    local need_sb_update=true
+    if [[ -x "${BIN_DIR}/singbox" ]] && [[ "$LOCAL_VER" = "$TARGET_VER" ]]; then
+        need_sb_update=false
+        say "本地已存版本 v${LOCAL_VER} 匹配目标版本 v${TARGET_VER}，跳过避让与下载，彻底规避哨兵死锁。"
+    fi
+
+    if [ "$need_sb_update" = "true" ]; then
+        say "正在下载安装 Sing-box v${TARGET_VER}..."
+        if [[ -f "${BIN_DIR}/singbox" ]]; then
+            mv -f "${BIN_DIR}/singbox" "${BIN_DIR}/singbox.old" >/dev/null 2>&1 || true
+            rm -f "${BIN_DIR}/singbox.old" >/dev/null 2>&1 &
+        fi
+        
+        # 隔离沙盒精准解压设计，防止 BIN_DIR 目录污染 (方案 A)
+        if curl -fL --retry 3 "https://github.com/SagerNet/sing-box/releases/download/v${TARGET_VER}/sing-box-${TARGET_VER}-linux-${ARCH}.tar.gz" -o /tmp/sb.tar.gz; then
+            mkdir -p /tmp/sb_unpack
+            tar -zxf /tmp/sb.tar.gz -C /tmp/sb_unpack || err "Sing-box 解压失败"
+            
+            local sb_bin
+            sb_bin=$(find /tmp/sb_unpack -type f -name "sing-box" | head -n1)
+            if [[ -f "$sb_bin" ]]; then
+                mv -f "$sb_bin" "${BIN_DIR}/singbox"
+            else
+                err "解压包中未找到有效的 sing-box 二进制执行程序"
             fi
-            rm -f /tmp/sb.tar.gz
+            # 清理沙盒
+            rm -rf /tmp/sb_unpack /tmp/sb.tar.gz
         else
             err "下载 Sing-box 失败"
         fi
     fi
 
-    chmod +x "${BIN_DIR}/"* || err "组件赋权失败"
+    # 4. 执行可执行权限变更 (精准点对点授权，拒绝 * 越权赋权) (方案 A)
+    chmod +x "${BIN_DIR}/xtunnel" "${BIN_DIR}/cloudflared" "${BIN_DIR}/singbox" || err "组件赋权失败"
+    
+    # 5. 引入 restorecon 恢复内核安全标签上下文
+    if command -v restorecon >/dev/null 2>&1; then
+        say "检测到 SELinux 安全策略处于激活状态，正在强制重构二进制目录上下文标签..."
+        restorecon -R "${BIN_DIR}" >/dev/null 2>&1 || true
+    fi
+
     chown -R "$SERVICE_USER":"$SERVICE_USER" "$LIB_DIR" "$LOG_DIR" || err "权限归属分配失败"
 }
 
 # --- 4. 配置写入 ---
 write_configs() {
     say "配置交互..."
-    read -p "请输入隧道连接 Token: " token
-    [[ -z "$token" ]] && err "Token 不能为空"
-    read -p "本地监听端口 (默认 56908): " ws_port; ws_port=${ws_port:-56908}
-    read -p "CF Tunnel Token (留空用临时域名): " cf_token
-    read -p "分流域名 (除默认外，逗号隔开): " extra_domains
+    
+    local token="${TOKEN}"
+    local ws_port="${WS_PORT}"
+    local cf_token="${CF_TOKEN}"
+    local extra_domains="${EXTRA_DOMAINS}"
+
+    # 检测 TTY 状态，支持 Headless 自动化非阻塞集成 (方案 B)
+    if [[ -z "$token" ]]; then
+        if [ -t 0 ]; then
+            read -p "请输入隧道连接 Token: " token
+            [[ -z "$token" ]] && err "Token 不能为空"
+        else
+            err "检测到无头 (Headless) 自动化环境，必须提供 TOKEN 环境变量 (例: TOKEN=xxx ./script.sh install)"
+        fi
+    fi
+
+    if [[ -z "$ws_port" ]]; then
+        if [ -t 0 ]; then
+            read -p "本地监听端口 (默认 56908): " ws_port
+        fi
+        ws_port=${ws_port:-56908}
+    fi
+
+    if [[ -z "$cf_token" ]]; then
+        if [ -t 0 ]; then
+            read -p "CF Tunnel Token (留空用临时域名): " cf_token
+        fi
+    fi
+
+    if [[ -z "$extra_domains" ]]; then
+        if [ -t 0 ]; then
+            read -p "分流域名 (除默认外，逗号隔开): " extra_domains
+        fi
+    fi
 
     local sb_port=$((RANDOM % 10000 + 40001))
     local m_port=$((RANDOM % 10000 + 30000))
@@ -383,42 +435,73 @@ EOF
     systemctl daemon-reload
 }
 
-# --- 6. 启动与日志诊断 ---
+# --- 6. 端口 Socket 检测与强时序串行拉起 ---
+wait_for_local_port() {
+    local port=$1
+    local name=$2
+    local max_wait=15
+    local wait_time=0
+    while ! ss -lnt 2>/dev/null | grep -q ":${port}"; do
+        if [ $wait_time -ge $max_wait ]; then
+            err "本地套接字端口 ${port} (${name}) 绑定超时，组件启动可能异常。"
+        fi
+        sleep 1
+        wait_time=$((wait_time + 1))
+    done
+    ok "本地套接字端口 ${port} (${name}) 绑定就绪。"
+}
+
 start_all() {
     say "正在激活隧道链路..."
     systemctl daemon-reload
     systemctl enable "$SB_SERVICE" "$XT_SERVICE" "$CF_SERVICE" >/dev/null 2>&1
+
+    # 1. 安全提取交互时写入的端口值
+    local ws_port sb_port metrics_port
+    if [ -f "${ETC_DIR}/env" ]; then
+        while IFS='=' read -r key value; do
+            if [[ "$key" =~ ^[A-Z0-9_]+$ ]]; then
+                eval "$key=\"$value\""
+            fi
+        done < "${ETC_DIR}/env"
+        ws_port="$WS_PORT"
+        sb_port="$SB_PORT"
+        metrics_port="$METRICS_PORT"
+    fi
+    ws_port=${ws_port:-56908}
+    sb_port=${sb_port:-40001}
+
+    # 2. 强时序串行拉起控制 (方案 C)
+    say "正在拉起基础路由层 (Sing-box)..."
+    systemctl start "$SB_SERVICE" || err "无法拉起 Sing-box 基础服务"
+    wait_for_local_port "$sb_port" "Sing-box SOCKS5"
+
+    say "正在拉起隧道核心桥接层 (xtunnel)..."
+    systemctl start "$XT_SERVICE" || err "无法拉起 xtunnel 传输服务"
+    wait_for_local_port "$ws_port" "xtunnel WebSocket"
+
+    say "正在拉起公网出口层 (cloudflared)..."
+    systemctl start "$CF_SERVICE" || err "无法拉起 cloudflared 出口服务"
     
-    systemctl restart "$CF_SERVICE"
-    
-    say "正在检测链路连通性..."
-    sleep 8
+    say "正在检测链路整体就绪状态..."
+    sleep 5
     
     if ! systemctl is-active --quiet "$CF_SERVICE"; then
-        say "\033[0;31m检测到链路异常，正在提取报错...\033[0m"
+        say "\033[0;31m检测到链路物理终端异常，正在提取故障日志...\033[0m"
         journalctl -u "$SB_SERVICE" -u "$XT_SERVICE" -u "$CF_SERVICE" --no-pager -n 20
         err "链路激活失败。"
     fi
 
     ok "隧道链路已全面就绪。"
     
-    if [ -f "${ETC_DIR}/env" ]; then
-        local WS_PORT SB_PORT METRICS_PORT TOKEN CF_TOKEN
-        while IFS='=' read -r key value; do
-            if [[ "$key" =~ ^[A-Z0-9_]+$ ]]; then
-                eval "$key=\"$value\""
-            fi
-        done < "${ETC_DIR}/env"
-
-        if [[ -n "$METRICS_PORT" ]]; then
-            local metrics_data domain
-            metrics_data=$(curl -s --connect-timeout 2 "http://127.0.0.1:${METRICS_PORT}/metrics" 2>/dev/null || true)
-            domain=$(echo "$metrics_data" | grep 'userHostname=' | sed -E 's/.*userHostname="https?:\/\/([^"]+)".*/\1/' | head -n1 || true)
-            if [[ -n "$domain" ]]; then
-                say "连接地址: https://$domain"
-            else
-                say "固定域名模式运行中，请检查 CF Dashboard。"
-            fi
+    if [[ -n "$metrics_port" ]]; then
+        local metrics_data domain
+        metrics_data=$(curl -s --connect-timeout 2 "http://127.0.0.1:${metrics_port}/metrics" 2>/dev/null || true)
+        domain=$(echo "$metrics_data" | grep 'userHostname=' | sed -E 's/.*userHostname="https?:\/\/([^"]+)".*/\1/' | head -n1 || true)
+        if [[ -n "$domain" ]]; then
+            say "连接地址: https://$domain"
+        else
+            say "固定域名模式运行中，请检查 CF Dashboard。"
         fi
     fi
 }
