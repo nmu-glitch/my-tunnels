@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# NMU Tunnel V12.6 - 最终自愈兼容版
-# - 修复：回归标准 "port" 字段，适配并通关 v1.13.x 现代 Sing-box 哨兵检测
-# - 安全：经典 TTY 交互式菜单回归，保留双模无头自适应识别
-# - 修复：支持在保持默认流媒体分流物理基建不变的前提下，去重并流追加新域名分流
-# - 健壮：整合 V12 系统的进程强杀、VFS 原子重命名避让、SELinux 标签修复
+# NMU Tunnel V12.7 - 终极稳定版
+# - 修复：校准入站配置字段，恢复为标准 "listen_port"，彻底通关 v1.13.x 哨兵检测
+# - 安全：经典 TTY 交互式菜单，保留双模无头自适应识别
+# - 修复：支持在保持默认流媒体分流绝对不受侵扰的前提下，去重并流追加新域名分流
+# - 健壮：整合进程强杀、VFS 原子重命名避让、SELinux 标签修复
 # =========================================================
 
 APP_NAME="nmu-tunnel"
@@ -19,7 +19,7 @@ SB_SERVICE="nmu-singbox.service"
 XT_SERVICE="nmu-xtunnel.service"
 CF_SERVICE="nmu-cloudflared.service"
 
-say() { echo -e "\033[0;34m[NMU-V12.6]\033[0m $*"; }
+say() { echo -e "\033[0;34m[NMU-V12.7]\033[0m $*"; }
 ok() { echo -e "\033[0;32m[OK]\033[0m $*"; }
 err() { echo -e "\033[0;31m[ERROR]\033[0m $*"; exit 1; }
 
@@ -362,14 +362,14 @@ EOF
     domains=$(printf ",%s" "${domain_array[@]}")
     domains=${domains:1}
 
-    # 【重要规范修复】：在 v1.10.x+ ~ v1.13.x 现代版本中，"listen_port" 已被废除。此处统一重构升级为官方标准 "port" 字段。
+    # 【深度修复】：坚决回归官方标准的 "listen_port" 字段，保障全版本 Sing-box 架构兼容
     cat > "${ETC_DIR}/singbox.json" <<EOF
 {
   "inbounds": [
     {
       "type": "socks",
       "listen": "127.0.0.1",
-      "port": ${sb_port}
+      "listen_port": ${sb_port}
     }
   ],
   "outbounds": [
@@ -596,7 +596,7 @@ uninstall_menu() {
 menu() {
     clear
     say "=================================================="
-    say "         NMU-Tunnel 最终加固导航版 (V12.6)         "
+    say "         NMU-Tunnel 最终加固导航版 (V12.7)         "
     say "=================================================="
     echo "  1. 启动并安装服务"
     echo "  2. 停止服务"
