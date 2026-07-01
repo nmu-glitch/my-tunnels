@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# NMU Tunnel V9.7 - 生产级安全改良版
-# - 修复：改用纯被动 /proc/locks 内核级无害化锁探测 (方案 A)
-# - 修复：引入 WARP 端口状态感知，自动降级为直连防黑洞 (方案 B)
+# NMU Tunnel V9.9 - 生产级安全自愈版
+# - 修复：引入全局 trap 守护，防止意外中断导致系统发行版标识永久损坏 (方案 1)
+# - 修复：自动扫描清洗并修正第三方 APT 污染源 (方案 1)
+# - 修复：引入带超时重试的 WARP 端口就绪状态自适应复查循环 (方案 2)
 # =========================================================
 
 APP_NAME="nmu-tunnel"
@@ -17,7 +18,10 @@ SB_SERVICE="nmu-singbox.service"
 XT_SERVICE="nmu-xtunnel.service"
 CF_SERVICE="nmu-cloudflared.service"
 
-say() { echo -e "\033[0;34m[NMU-V9.7]\033[0m $*"; }
+# 跟踪状态变量
+OS_RELEASE_BACKED_UP=false
+
+say() { echo -e "\033[0;34m[NMU-V9.9]\033[0m $*"; }
 ok() { echo -e "\033[0;32m[OK]\033[0m $*"; }
 err() { echo -e "\033[0;31m[ERROR]\033[0m $*"; exit 1; }
 
@@ -25,7 +29,29 @@ require_root() {
     [[ "$(id -u)" -ne 0 ]] && err "请使用 root 权限执行 (sudo $0 install)"
 }
 
-# --- 1. 无害化内核级锁探测 (方案 A) ---
+# --- 1. 信号捕获与系统环境物理还原 (方案 1) ---
+cleanup_os_release() {
+    local exit_code=$?
+    # 1. 物理还原 /etc/os-release
+    if [ "$OS_RELEASE_BACKED_UP" = "true" ] && [ -f /etc/os-release.bak ]; then
+        mv /etc/os-release.bak /etc/os-release
+        OS_RELEASE_BACKED_UP=false
+        say "已安全还原系统发行版原始标识 (/etc/os-release)。"
+        
+        # 2. 清洗并修正生态污染：将 cloudflare-client.list 中伪装的 jammy 改回系统真实代号
+        local actual_codename
+        actual_codename=$(grep "VERSION_CODENAME=" /etc/os-release | cut -d= -f2 | tr -d '"' || true)
+        if [[ -n "$actual_codename" ]] && [ -f /etc/apt/sources.list.d/cloudflare-client.list ]; then
+            if grep -q "jammy" /etc/apt/sources.list.d/cloudflare-client.list; then
+                sed -i "s/jammy/${actual_codename}/g" /etc/apt/sources.list.d/cloudflare-client.list
+                say "已自动修正残留的 APT 第三方源代号至: ${actual_codename}"
+            fi
+        fi
+    fi
+    exit "$exit_code"
+}
+
+# --- 2. 无害化内核级锁探测 ---
 is_dpkg_locked() {
     local lock_files=("/var/lib/dpkg/lock-frontend" "/var/lib/dpkg/lock" "/var/lib/apt/lists/lock")
     for lock_file in "${lock_files[@]}"; do
@@ -33,14 +59,13 @@ is_dpkg_locked() {
             local inode
             inode=$(stat -c '%i' "$lock_file" 2>/dev/null || true)
             if [[ -n "$inode" ]]; then
-                # 在内核 /proc/locks 中检索该 Inode 是否有 active 锁
                 if grep -q -E ":${inode}(\s|$)" /proc/locks 2>/dev/null; then
-                    return 0 # 处于锁定状态
+                    return 0
                 fi
             fi
         fi
     done
-    return 1 # 未锁定
+    return 1
 }
 
 wait_for_apt() {
@@ -70,7 +95,7 @@ install_deps() {
     fi
 }
 
-# --- 2. WARP 部署引擎 ---
+# --- 3. WARP 部署引擎 (含伪装控制) ---
 setup_warp() {
     if ss -lnt 2>/dev/null | grep -q ":40000"; then
         ok "WARP 代理已就绪 (40000 端口)。"
@@ -79,13 +104,42 @@ setup_warp() {
     say "正在自动部署官方 WARP SOCKS5 代理..."
     if curl -fsSL https://raw.githubusercontent.com/P3TERX/warp.sh/main/warp.sh -o /tmp/warp.sh; then
         chmod +x /tmp/warp.sh
-        /tmp/warp.sh s5 -p 40000 || say "警告: WARP 自动部署失败，分流层可能失效。"
+        
+        # 如果检测到 Ubuntu 24.04 (noble)，临时变更为 jammy (22.04) 以匹配部署脚本
+        if [ -f /etc/os-release ] && grep -q "noble" /etc/os-release; then
+            say "检测到 Ubuntu 24.04 环境，临时注入 Ubuntu 22.04 (Jammy) 标识..."
+            cp /etc/os-release /etc/os-release.bak
+            OS_RELEASE_BACKED_UP=true
+            sed -i 's/VERSION_CODENAME=noble/VERSION_CODENAME=jammy/g' /etc/os-release
+            sed -i 's/UBUNTU_CODENAME=noble/UBUNTU_CODENAME=jammy/g' /etc/os-release
+        fi
+        
+        # 执行 WARP 部署
+        /tmp/warp.sh s5 -p 40000 || say "警告: WARP 自动部署脚本执行异常，分流层可能失效。"
+        
+        # 显式手动还原系统标识 (正常结束时，提前还原，降低 trap 触发时的冗余工作)
+        cleanup_os_release
     else
         say "警告: 无法下载 WARP 部署脚本，分流层可能失效。"
     fi
 }
 
-# --- 3. 组件同步 ---
+# --- 4. 自适应套接字探测循环 (方案 2) ---
+wait_for_warp_port() {
+    say "验证 WARP 代理本地套接字状态 (自适应复查中)..."
+    local max_attempts=15
+    local attempt=0
+    while [ $attempt -lt $max_attempts ]; do
+        if ss -lnt 2>/dev/null | grep -q ":40000"; then
+            return 0  # 端口就绪
+        fi
+        sleep 2
+        attempt=$((attempt + 1))
+    done
+    return 1  # 超时未启动
+}
+
+# --- 5. 组件同步 ---
 get_sb_version() {
     local raw_json v
     raw_json=$(curl -sL --connect-timeout 10 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null)
@@ -120,7 +174,7 @@ create_env() {
     local SB_VER
     SB_VER=$(get_sb_version)
     if [[ -z "$SB_VER" ]]; then
-        SB_VER="1.8.11" # 安全回滚版本
+        SB_VER="1.8.11"
         say "无法解析最新 Sing-box 版本，自动启用安全备用版本: v${SB_VER}"
     fi
     
@@ -139,7 +193,7 @@ create_env() {
     chown -R "$SERVICE_USER":"$SERVICE_USER" "$LIB_DIR" "$LOG_DIR" || err "权限归属分配失败"
 }
 
-# --- 4. 配置交互与感知分流模板 (方案 B) ---
+# --- 6. 配置交互与感知分流模板 ---
 write_configs() {
     say "配置交互..."
     read -p "请输入隧道连接 Token: " token
@@ -166,14 +220,13 @@ EOF
         done
     fi
 
-    # 方案 B：WARP 状态感知决策
     local warp_outbound
-    if ss -lnt 2>/dev/null | grep -q ":40000"; then
+    if wait_for_warp_port; then
         warp_outbound='{"type": "socks", "tag": "warp", "server": "127.0.0.1", "server_port": 40000}'
-        ok "检测到本地 WARP 运行中，流媒体路由将通过 WARP 出口。"
+        ok "WARP 代理套接字检测就绪，流媒体分流已启用。"
     else
         warp_outbound='{"type": "direct", "tag": "warp"}'
-        say "警告: 未检测到 WARP 代理。已自动将分流路由无缝降级为 [直连] 模式，防止黑洞异常。"
+        say "警告: 未检测到本地 WARP 活动端口。已将分流路由降级为 [直连] 模式，防止网络黑洞。"
     fi
 
     cat > "${ETC_DIR}/singbox.json" <<EOF
@@ -193,7 +246,7 @@ EOF
     chmod 640 "${ETC_DIR}/"*
 }
 
-# --- 5. Systemd 级联链路 ---
+# --- 7. Systemd 级联链路 ---
 write_units() {
     say "部署 Systemd 强耦合链路..."
 
@@ -213,7 +266,7 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-    # 2. xtunnel (依赖 Singbox，通过 PartOf 保证联动，不牺牲独立崩溃自愈能力)
+    # 2. xtunnel
     cat > "/etc/systemd/system/${XT_SERVICE}" <<EOF
 [Unit]
 Description=NMU xtunnel Core
@@ -232,7 +285,7 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
-    # 3. cloudflared (依赖 xtunnel)
+    # 3. cloudflared
     cat > "/etc/systemd/system/${CF_SERVICE}" <<EOF
 [Unit]
 Description=NMU Cloudflared Exit
@@ -254,13 +307,12 @@ EOF
     systemctl daemon-reload
 }
 
-# --- 6. 启动与日志诊断 ---
+# --- 8. 启动与日志诊断 ---
 start_all() {
     say "正在激活隧道链路..."
     systemctl daemon-reload
     systemctl enable "$SB_SERVICE" "$XT_SERVICE" "$CF_SERVICE" >/dev/null 2>&1
     
-    # 仅需拉起最上游，系统将依依赖链自动唤醒底层服务
     systemctl restart "$CF_SERVICE"
     
     say "正在检测链路连通性..."
@@ -299,6 +351,8 @@ start_all() {
 case "${1:-help}" in
     install)
         require_root
+        # 方案 1：在执行期注册全局 trap，保障在任何意外退出时还原系统文件
+        trap cleanup_os_release EXIT INT TERM
         install_deps
         setup_warp
         create_env
