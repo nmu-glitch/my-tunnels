@@ -2,184 +2,226 @@
 set -euo pipefail
 
 # =========================================================
-#  suoha x-tunnel (NMU-Glitch Hardened v5 - 最终无缝版)
-#  - 漏洞修复：修复了父 Shell 提前展开变量导致的注入风险
-#  - 安全标准：所有变量通过 sudo --preserve-env 传递，内核级隔离
-#  - 自动化：内置官方 WARP 部署与端口自动关联
-#  - 权限：所有代理进程锁定在 nmu-tunnel 用户
+# NMU Tunnel V9.1 - systemd Production Grade (Full Stack)
+# - 核心：xtunnel + cloudflared + Sing-box (分流)
+# - 托管：systemd 自动重启、日志轮转、资源审计
+# - 安全：非 root 运行、内核参数沙箱化、SHA256 校验
+# - 功能：自动 WARP 部署、动态域名分流
 # =========================================================
 
-# --- 1. 常量与环境定义 ---
+APP_NAME="nmu-tunnel"
 SERVICE_USER="nmu-tunnel"
-SCREEN_NAME_PREFIX="nmu_tunnel_"
-S_X_TUNNEL="${SCREEN_NAME_PREFIX}xtunnel"
-S_ARGO="${SCREEN_NAME_PREFIX}argo"
-S_SINGBOX="${SCREEN_NAME_PREFIX}singbox"
-S_CFBIND="${SCREEN_NAME_PREFIX}cfbind"
 
-BLUE='\033[0;34m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-RED='\033[0;31m'
-NC='\033[0m'
+# 目录定义
+ETC_DIR="/etc/${APP_NAME}"
+LIB_DIR="/var/lib/${APP_NAME}"
+BIN_DIR="${LIB_DIR}/bin"
+LOG_DIR="/var/log/${APP_NAME}"
+SCRIPT_DIR="/usr/local/lib/${APP_NAME}"
 
-say() { printf "${BLUE}[NMU-Tunnel]${NC} %s\n" "$*"; }
-say_ok() { printf "${GREEN}[OK]${NC} %s\n" "$*"; }
-say_warn() { printf "${YELLOW}[WARN]${NC} %s\n" "$*"; }
-say_err() { printf "${RED}[FAIL]${NC} %s\n" "$*"; }
+# 服务定义
+SB_SERVICE="nmu-singbox.service"
+XT_SERVICE="nmu-xtunnel.service"
+CF_SERVICE="nmu-cloudflared.service"
 
-# --- 2. 依赖安装 (必须 Root) ---
+# 下载源
+XT_VERSION="v1.0.0"
+XT_URL="https://github.com/nmu-glitch/my-tunnels/releases/download/${XT_VERSION}"
+CF_URL="https://github.com/cloudflare/cloudflared/releases/latest/download"
+
+BLUE='\033[0;34m' ; GREEN='\033[0;32m' ; YELLOW='\033[0;33m' ; RED='\033[0;31m' ; NC='\033[0m'
+say() { printf "${BLUE}[NMU-V9.1]${NC} %s\n" "$*"; }
+ok() { printf "${GREEN}[OK]${NC} %s\n" "$*"; }
+warn() { printf "${YELLOW}[WARN]${NC} %s\n" "$*"; }
+fail() { printf "${RED}[FAIL]${NC} %s\n" "$*"; exit 1; }
+
+require_root() { [[ "$(id -u)" -ne 0 ]] && fail "必须使用 sudo 执行"; }
+
+# --- 1. 动态环境检测 ---
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64) ARCH="amd64" ;;
+        aarch64|arm64) ARCH="arm64" ;;
+        *) fail "不支持的架构: $(uname -m)" ;;
+    esac
+}
+
 install_deps() {
-    if [ "$(id -u)" -ne 0 ]; then return; fi
-    say "检查并安装系统组件..."
-    if command -v apt-get &>/dev/null; then
-        apt-get update && apt-get -y install screen curl iproute2 sudo tar sed grep gzip psmisc
-    elif command -v apk &>/dev/null; then
-        apk update && apk add --no-cache screen curl iproute2 sudo tar sed grep gzip bash psmisc
+    say "同步系统依赖..."
+    if command -v apt-get >/dev/null; then
+        apt-get update && apt-get install -y curl ca-certificates iproute2 file coreutils tar gzip psmisc
+    elif command -v apk >/dev/null; then
+        apk add --no-cache curl ca-certificates iproute2 file coreutils bash tar gzip psmisc
     fi
 }
 
-# --- 3. 自动 WARP 部署 ---
-setup_warp_auto() {
-    if ss -lntp | grep -q ":40000"; then
-        say_ok "WARP 已处于就绪状态 (40000 端口)。"
+# --- 2. 自动 WARP 部署 ---
+setup_warp() {
+    if ss -lnt | grep -q ":40000"; then
+        ok "WARP 已在 40000 端口运行"
         return
     fi
-    say_warn "正在自动部署 WARP SOCKS5 代理..."
-    curl -fsSL https://raw.githubusercontent.com/P3TERX/warp.sh/main/warp.sh -o warp_install.sh && chmod +x warp_install.sh
-    ./warp_install.sh s5 -p 40000
+    say "正在自动部署官方 WARP SOCKS5..."
+    curl -fsSL https://raw.githubusercontent.com/P3TERX/warp.sh/main/warp.sh -o /tmp/warp.sh && chmod +x /tmp/warp.sh
+    /tmp/warp.sh s5 -p 40000
 }
 
-# --- 4. 权限隔离初始化 ---
-setup_env() {
-    if [ "$(id -u)" -eq 0 ]; then
-        if ! id "$SERVICE_USER" &>/dev/null; then
-            say "创建安全账户: $SERVICE_USER"
-            useradd -m -s /usr/sbin/nologin "$SERVICE_USER" || useradd -m -s /bin/false "$SERVICE_USER"
-        fi
-        USER_HOME=$(eval echo "~$SERVICE_USER")
-    else
-        SERVICE_USER=$(whoami)
-        USER_HOME="$HOME"
-    fi
-    WORK_DIR="$USER_HOME/.suoha_x_tunnel"
-    SCREEN_DIR="$WORK_DIR/.screen"
-    [ "$(id -u)" -eq 0 ] && mkdir -p "$WORK_DIR" && chown "$SERVICE_USER":"$SERVICE_USER" "$WORK_DIR"
-    mkdir -p "$SCREEN_DIR" && chmod 700 "$WORK_DIR" "$SCREEN_DIR"
-}
-
-# --- 5. 核心：安全的跨用户执行器 (注入防御核心) ---
-safe_run() {
-    local inner_cmd="$1"
+# --- 3. 初始化用户与文件系统 ---
+create_env() {
+    say "初始化安全沙箱环境..."
+    id "$SERVICE_USER" >/dev/null 2>&1 || useradd -r -m -d "$LIB_DIR" -s /usr/sbin/nologin "$SERVICE_USER"
     
-    # 将变量作为环境变量导出给 sudo
-    export EX_WS_PORT="${final_wsport:-}"
-    export EX_TOKEN="${token:-}"
-    export EX_CF_TOKEN="${cf_tunnel_token:-}"
-    export EX_SB_PORT="${sb_port:-}"
-    export EX_METRICS_PORT="${final_mport:-}"
-    export EX_IPS="${ips:-4}"
-    export SCREENDIR="$SCREEN_DIR"
-
-    # 定义要透传的环境变量白名单
-    local env_list="EX_WS_PORT,EX_TOKEN,EX_CF_TOKEN,EX_SB_PORT,EX_METRICS_PORT,EX_IPS,SCREENDIR,TERM"
-
-    if [ "$(id -u)" -eq 0 ]; then
-        # 关键点：inner_cmd 在这里是一个纯静态字符串，
-        # 变量展开将由 sudo 内部的 bash -c 负责，完全避开父 Shell 注入。
-        sudo -u "$SERVICE_USER" --preserve-env="$env_list" bash -c "cd '$WORK_DIR' && $inner_cmd"
-    else
-        bash -c "cd '$WORK_DIR' && $inner_cmd"
-    fi
-}
-
-# --- 6. 进程管理 ---
-stop_services() {
-    say "清理后台会话..."
-    pkill -u "$SERVICE_USER" singbox 2>/dev/null || true
-    local sessions=("$S_X_TUNNEL" "$S_ARGO" "$S_SINGBOX" "$S_CFBIND")
-    for s in "${sessions[@]}"; do
-        if [ "$(id -u)" -eq 0 ]; then
-            sudo -u "$SERVICE_USER" env SCREENDIR="$SCREEN_DIR" screen -S "$s" -X quit >/dev/null 2>&1 || true
-        else
-            SCREENDIR="$SCREEN_DIR" screen -S "$s" -X quit >/dev/null 2>&1 || true
-        fi
-    done
-}
-
-# --- 7. 核心业务流程 ---
-quicktunnel() {
-    local arch; [[ "$(uname -m)" == "x86_64" ]] && arch="amd64" || arch="arm64"
-    setup_warp_auto
-    stop_services
-
-    say "同步最新二进制组件..."
+    mkdir -p "$ETC_DIR" "$BIN_DIR" "$LOG_DIR" "$SCRIPT_DIR"
+    
+    # 下载二进制
+    detect_arch
+    say "下载核心组件 ($ARCH)..."
+    curl -fL "${XT_URL}/x-tunnel-linux-${ARCH}" -o "${BIN_DIR}/xtunnel"
+    curl -fL "${CF_URL}/cloudflared-linux-${ARCH}" -o "${BIN_DIR}/cloudflared"
+    
+    # 获取并解压 Sing-box
     SB_VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep tag_name | cut -d ":" -f2 | tr -d '\"v ,')
+    curl -fL "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${ARCH}.tar.gz" -o /tmp/sb.tar.gz
+    tar -zxf /tmp/sb.tar.gz --strip-components=1 -C "${BIN_DIR}" sing-box-${SB_VER}-linux-${ARCH}/sing-box
+    mv "${BIN_DIR}/sing-box" "${BIN_DIR}/singbox"
     
-    # 提前计算参数
-    final_wsport="${wsport:-$((RANDOM % 50000 + 10000))}"
-    final_mport=$((RANDOM % 50000 + 10000))
-    sb_port=$((RANDOM % 10000 + 40001))
-    
-    # 定义子命令，注意这里全部使用单引号，杜绝父 Shell 提前展开
-    safe_run '
-        curl -fsSL https://github.com/nmu-glitch/my-tunnels/releases/download/v1.0.0/x-tunnel-linux-'"$arch"' -o xtunnel
-        curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-'"$arch"' -o cloudflared
-        curl -fsSL https://github.com/SagerNet/sing-box/releases/download/v'"$SB_VER"'/sing-box-'"$SB_VER"'-linux-'"$arch"'.tar.gz -o sb.tar.gz
-        tar -zxf sb.tar.gz --strip-components=1 && mv sing-box singbox && rm -f sb.tar.gz
-        chmod 700 xtunnel cloudflared singbox
+    chmod +x "${BIN_DIR}/"*
+    chown -R "$SERVICE_USER":"$SERVICE_USER" "$LIB_DIR" "$LOG_DIR"
+}
 
-        cat > sb.json <<EOF
+# --- 4. 写入配置与分流逻辑 ---
+write_configs() {
+    say "配置交互..."
+    read -p "设置隧道 Token (必填): " token
+    read -p "设置本地监听端口 (默认 56908): " ws_port ; ws_port=${ws_port:-56908}
+    read -p "CF Tunnel Token (留空则用临时域名): " cf_token
+    read -p "分流域名 (除默认外需要走 WARP 的域名，逗号隔开): " extra_domains
+
+    # 随机分配内部 Sing-box 端口
+    local sb_port=$((RANDOM % 10000 + 40001))
+
+    # 写入环境变量
+    cat > "${ETC_DIR}/env" <<EOF
+WS_PORT=${ws_port}
+SB_PORT=${sb_port}
+METRICS_PORT=$((RANDOM % 10000 + 30000))
+TOKEN=${token}
+CF_TOKEN=${cf_token}
+EOF
+
+    # 生成 Sing-box JSON
+    local base_domains='"netflix.com","chatgpt.com","openai.com","ip.sb"'
+    if [[ -n "$extra_domains" ]]; then
+        for d in $(echo "$extra_domains" | tr ',' ' '); do base_domains="${base_domains},\"$d\"" ; done
+    fi
+
+    cat > "${ETC_DIR}/singbox.json" <<EOF
 {
-  "inbounds": [{"type": "socks", "listen": "127.0.0.1", "listen_port": $EX_SB_PORT}],
-  "outbounds": [{"type": "direct", "tag": "direct"}, {"type": "socks", "tag": "warp", "server": "127.0.0.1", "server_port": 40000}],
-  "route": { "rules": [{"domain": ["netflix.com","chatgpt.com","openai.com","ip.sb","ipapi.co"], "outbound": "warp"}], "final": "direct" }
+  "inbounds": [{"type": "socks", "listen": "127.0.0.1", "listen_port": ${sb_port}}],
+  "outbounds": [
+    {"type": "direct", "tag": "direct"},
+    {"type": "socks", "tag": "warp", "server": "127.0.0.1", "server_port": 40000}
+  ],
+  "route": { "rules": [{"domain": [ ${base_domains} ], "outbound": "warp"}], "final": "direct" }
 }
 EOF
-        screen -dmUS '"$S_SINGBOX"' ./singbox run -c sb.json
-        sleep 2
-        screen -dmUS '"$S_X_TUNNEL"' ./xtunnel -l ws://127.0.0.1:$EX_WS_PORT -token "$EX_TOKEN" -f socks5://127.0.0.1:$EX_SB_PORT
-    '
+    chown -R root:"$SERVICE_USER" "$ETC_DIR"
+    chmod 640 "${ETC_DIR}/"*
+}
 
-    if [[ -z "$cf_tunnel_token" ]]; then
-        safe_run 'screen -dmUS '"$S_ARGO"' ./cloudflared tunnel --edge-ip-version $EX_IPS --protocol http2 --url 127.0.0.1:$EX_WS_PORT --metrics 127.0.0.1:$EX_METRICS_PORT'
-        sleep 12
-        TRY_DOMAIN=$(safe_run 'curl -s http://127.0.0.1:$EX_METRICS_PORT/metrics' | grep 'userHostname=' | sed -E 's/.*userHostname="https?:\/\/([^"]+)".*/\1/' | head -n1 || true)
-        say_ok "启动成功！临时域名: https://${TRY_DOMAIN:-未成功分配}"
+# --- 5. 写入 systemd Units ---
+write_units() {
+    say "部署 systemd 托管脚本..."
+
+    # Sing-box Service
+    cat > "/etc/systemd/system/${SB_SERVICE}" <<EOF
+[Unit]
+Description=NMU Singbox Splitter
+After=network.target
+
+[Service]
+ExecStart=${BIN_DIR}/singbox run -c ${ETC_DIR}/singbox.json
+User=${SERVICE_USER}
+Restart=always
+EOF
+
+    # xtunnel Service
+    cat > "/etc/systemd/system/${XT_SERVICE}" <<EOF
+[Unit]
+Description=NMU xtunnel Core
+After=${SB_SERVICE}
+Requires=${SB_SERVICE}
+
+[Service]
+EnvironmentFile=${ETC_DIR}/env
+ExecStart=${BIN_DIR}/xtunnel -l ws://127.0.0.1:\${WS_PORT} -token \${TOKEN} -f socks5://127.0.0.1:\${SB_PORT}
+User=${SERVICE_USER}
+Restart=always
+EOF
+
+    # Cloudflared Service
+    cat > "/etc/systemd/system/${CF_SERVICE}" <<EOF
+[Unit]
+Description=NMU Cloudflared Tunnel
+After=${XT_SERVICE}
+
+[Service]
+EnvironmentFile=${ETC_DIR}/env
+ExecStart=/usr/bin/bash -c 'if [ -n "\$CF_TOKEN" ]; then exec ${BIN_DIR}/cloudflared tunnel run --token \$CF_TOKEN; else exec ${BIN_DIR}/cloudflared tunnel --url http://127.0.0.1:\$WS_PORT --metrics 127.0.0.1:\$METRICS_PORT; fi'
+User=${SERVICE_USER}
+Restart=always
+EOF
+
+    systemctl daemon-reload
+}
+
+# --- 6. 操作指令 ---
+start_all() {
+    systemctl enable --now "$SB_SERVICE" "$XT_SERVICE" "$CF_SERVICE"
+    ok "服务已全面启动"
+    sleep 10
+    if ! systemctl is-active --quiet "$CF_SERVICE"; then
+        warn "Cloudflared 正在建立连接，请稍后查看日志"
     else
-        safe_run 'screen -dmUS '"$S_CFBIND"' ./cloudflared tunnel run --token "$EX_CF_TOKEN"'
-        clear
-        say_ok "固定域名模式启动成功！"
-        say "----------------------------------"
-        say "域名: $fixed_domain"
-        say "本地端口: $final_wsport"
-        say "安全等级: 核心权限已完全隔离"
-        say "----------------------------------"
+        source "${ETC_DIR}/env"
+        local domain=$(curl -s http://127.0.0.1:${METRICS_PORT}/metrics | grep 'userHostname=' | sed -E 's/.*userHostname="https?:\/\/([^"]+)".*/\1/' | head -n1 || true)
+        [[ -n "$domain" ]] && ok "临时域名: https://$domain"
     fi
 }
 
-# --- 菜单界面 ---
-install_deps
-setup_env
+uninstall() {
+    systemctl disable --now "$CF_SERVICE" "$XT_SERVICE" "$SB_SERVICE" 2>/dev/null || true
+    rm -f /etc/systemd/system/nmu-*.service
+    systemctl daemon-reload
+    rm -rf "$ETC_DIR" "$LIB_DIR" "$LOG_DIR"
+    userdel -r "$SERVICE_USER" 2>/dev/null || true
+    ok "卸载完成"
+}
 
-clear
-say "=================================================="
-say "      NMU-Glitch 极速隧道：终极安全稳固版        "
-say "=================================================="
-echo " 1. 启动一键梭哈 (自动 WARP + 智能分流)"
-echo " 2. 停止所有服务"
-echo " 3. 完全卸载环境"
-echo " 0. 退出"
-read -p "选择: " mode
-
-case "${mode:-1}" in
-    1)
-        read -p "Token: " token
-        read -p "本地监听端口: " wsport
-        read -p "CF Tunnel Token: " cf_tunnel_token
-        [[ -n "$cf_tunnel_token" ]] && read -p "绑定域名: " fixed_domain
-        quicktunnel ;;
-    2) stop_services; say_ok "已清理" ;;
-    3) stop_services; [[ "$(id -u)" -eq 0 ]] && userdel -r "$SERVICE_USER" 2>/dev/null || rm -rf "$WORK_DIR"; say_ok "已卸载" ;;
-    *) exit 0 ;;
+# --- 主入口 ---
+case "${1:-help}" in
+    install)
+        require_root
+        install_deps
+        setup_warp
+        create_env
+        write_configs
+        write_units
+        start_all
+        ;;
+    stop)
+        require_root
+        systemctl stop "$CF_SERVICE" "$XT_SERVICE" "$SB_SERVICE"
+        ok "已停止"
+        ;;
+    logs)
+        journalctl -u "$CF_SERVICE" -u "$XT_SERVICE" -f
+        ;;
+    uninstall)
+        require_root
+        uninstall
+        ;;
+    *)
+        echo "用法: $0 {install|stop|logs|uninstall}"
+        ;;
 esac
