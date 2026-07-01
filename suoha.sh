@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# NMU Tunnel V9.9 - 生产级安全自愈版
-# - 修复：引入全局 trap 守护，防止意外中断导致系统发行版标识永久损坏 (方案 1)
-# - 修复：自动扫描清洗并修正第三方 APT 污染源 (方案 1)
-# - 修复：引入带超时重试的 WARP 端口就绪状态自适应复查循环 (方案 2)
+# NMU Tunnel V11.1 - 生产级原生抗断网自愈版
+# - 修复：基于强正则表达式防断裂提取 + Sing-box JSON 语法哨兵，彻底免疫配置破碎崩溃 (方案 1)
+# - 修复：引入双栈网络探测，针对单 IPv4 宿主机自动裁剪隧道，防止 IPv6 泄露半断网黑洞 (方案 2)
 # =========================================================
 
 APP_NAME="nmu-tunnel"
@@ -18,10 +17,7 @@ SB_SERVICE="nmu-singbox.service"
 XT_SERVICE="nmu-xtunnel.service"
 CF_SERVICE="nmu-cloudflared.service"
 
-# 跟踪状态变量
-OS_RELEASE_BACKED_UP=false
-
-say() { echo -e "\033[0;34m[NMU-V9.9]\033[0m $*"; }
+say() { echo -e "\033[0;34m[NMU-V11.1]\033[0m $*"; }
 ok() { echo -e "\033[0;32m[OK]\033[0m $*"; }
 err() { echo -e "\033[0;31m[ERROR]\033[0m $*"; exit 1; }
 
@@ -29,29 +25,7 @@ require_root() {
     [[ "$(id -u)" -ne 0 ]] && err "请使用 root 权限执行 (sudo $0 install)"
 }
 
-# --- 1. 信号捕获与系统环境物理还原 (方案 1) ---
-cleanup_os_release() {
-    local exit_code=$?
-    # 1. 物理还原 /etc/os-release
-    if [ "$OS_RELEASE_BACKED_UP" = "true" ] && [ -f /etc/os-release.bak ]; then
-        mv /etc/os-release.bak /etc/os-release
-        OS_RELEASE_BACKED_UP=false
-        say "已安全还原系统发行版原始标识 (/etc/os-release)。"
-        
-        # 2. 清洗并修正生态污染：将 cloudflare-client.list 中伪装的 jammy 改回系统真实代号
-        local actual_codename
-        actual_codename=$(grep "VERSION_CODENAME=" /etc/os-release | cut -d= -f2 | tr -d '"' || true)
-        if [[ -n "$actual_codename" ]] && [ -f /etc/apt/sources.list.d/cloudflare-client.list ]; then
-            if grep -q "jammy" /etc/apt/sources.list.d/cloudflare-client.list; then
-                sed -i "s/jammy/${actual_codename}/g" /etc/apt/sources.list.d/cloudflare-client.list
-                say "已自动修正残留的 APT 第三方源代号至: ${actual_codename}"
-            fi
-        fi
-    fi
-    exit "$exit_code"
-}
-
-# --- 2. 无害化内核级锁探测 ---
+# --- 1. 内核级锁检测 ---
 is_dpkg_locked() {
     local lock_files=("/var/lib/dpkg/lock-frontend" "/var/lib/dpkg/lock" "/var/lib/apt/lists/lock")
     for lock_file in "${lock_files[@]}"; do
@@ -95,51 +69,84 @@ install_deps() {
     fi
 }
 
-# --- 3. WARP 部署引擎 (含伪装控制) ---
-setup_warp() {
-    if ss -lnt 2>/dev/null | grep -q ":40000"; then
-        ok "WARP 代理已就绪 (40000 端口)。"
-        return
+# --- 2. 强正则凭证提取与自适应栈探测 (方案 1 + 方案 2) ---
+get_warp_profile() {
+    say "正在向公网生成器获取官方 WARP 原生凭证..."
+    local warpurl raw_pvk raw_wpv6 raw_res
+    
+    # 获取原始数据
+    warpurl=$(curl -sm6 -k https://warp.xijp.eu.org 2>/dev/null || wget --tries=2 -qO- https://warp.xijp.eu.org 2>/dev/null || true)
+    
+    # 彻底滤除换行符、多余双引号与空白
+    warpurl=$(echo "$warpurl" | tr -d '\r' | tr -d '"')
+    
+    # 采用强正则模式防御性提取，杜绝全角/半角切割失效问题 (方案 1)
+    raw_pvk=$(echo "$warpurl" | grep -i "Private_key" | grep -oE "[A-Za-z0-9+/]{43}=" | head -n1 || true)
+    raw_wpv6=$(echo "$warpurl" | grep -i "IPV6" | grep -oE "([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}" | head -n1 || true)
+    if [[ -z "$raw_wpv6" ]]; then
+        # 兼容简写或非标准格式的 IPv6
+        raw_wpv6=$(echo "$warpurl" | grep -i "IPV6" | grep -oE "([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}" | head -n1 || true)
     fi
-    say "正在自动部署官方 WARP SOCKS5 代理..."
-    if curl -fsSL https://raw.githubusercontent.com/P3TERX/warp.sh/main/warp.sh -o /tmp/warp.sh; then
-        chmod +x /tmp/warp.sh
-        
-        # 如果检测到 Ubuntu 24.04 (noble)，临时变更为 jammy (22.04) 以匹配部署脚本
-        if [ -f /etc/os-release ] && grep -q "noble" /etc/os-release; then
-            say "检测到 Ubuntu 24.04 环境，临时注入 Ubuntu 22.04 (Jammy) 标识..."
-            cp /etc/os-release /etc/os-release.bak
-            OS_RELEASE_BACKED_UP=true
-            sed -i 's/VERSION_CODENAME=noble/VERSION_CODENAME=jammy/g' /etc/os-release
-            sed -i 's/UBUNTU_CODENAME=noble/UBUNTU_CODENAME=jammy/g' /etc/os-release
-        fi
-        
-        # 执行 WARP 部署
-        /tmp/warp.sh s5 -p 40000 || say "警告: WARP 自动部署脚本执行异常，分流层可能失效。"
-        
-        # 显式手动还原系统标识 (正常结束时，提前还原，降低 trap 触发时的冗余工作)
-        cleanup_os_release
+    raw_res=$(echo "$warpurl" | grep -i "reserved" | grep -oE "\[[0-9]+,\s*[0-9]+,\s*[0-9]+\]" | head -n1 || true)
+
+    # 规范化清理
+    raw_pvk=$(echo "$raw_pvk" | xargs || true)
+    raw_wpv6=$(echo "$raw_wpv6" | xargs || true)
+    raw_res=$(echo "$raw_res" | xargs || true)
+
+    local pvk_valid=false
+    local wpv6_valid=false
+    local res_valid=false
+
+    # 格式规范性硬性校验
+    [[ "$raw_pvk" =~ ^[A-Za-z0-9+/]{43}=$ ]] && pvk_valid=true
+    [[ "$raw_wpv6" =~ ^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$ ]] && wpv6_valid=true
+    [[ "$raw_res" =~ ^\[[0-9]+,\s*[0-9]+,\s*[0-9]+\]$ ]] && res_valid=true
+
+    local final_pvk final_wpv6 final_res
+    
+    if [ "$pvk_valid" = "true" ] && [ "$wpv6_valid" = "true" ] && [ "$res_valid" = "true" ]; then
+        final_pvk="$raw_pvk"
+        final_wpv6="$raw_wpv6"
+        final_res="$raw_res"
+        ok "成功拉取并验证动态 WARP 凭证。"
     else
-        say "警告: 无法下载 WARP 部署脚本，分流层可能失效。"
+        say "警告: 远程凭证校验失败 (解析截断或格式不匹配)。正在启用预设安全凭证..."
+        final_pvk="52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A="
+        final_wpv6="2606:4700:110:8d8d:1845:c39f:2dd5:a03a"
+        final_res="[215, 69, 233]"
     fi
+
+    # 独立探测双栈连通性，裁剪虚拟路由防止 IPv6 半断网黑洞 (方案 2)
+    local has_v6=false
+    if curl -s6m3 https://icanhazip.com >/dev/null 2>&1; then
+        has_v6=true
+    fi
+
+    local endpoint="162.159.192.1"
+    local local_address_json='["172.16.0.2/32"]'
+
+    if [ "$has_v6" = "true" ]; then
+        # 仅对存在物理双栈网络环境的宿主机开启双栈 Wireguard 路由
+        endpoint="[2606:4700:d0::a29f:c001]"
+        local_address_json="[\"172.16.0.2/32\", \"${final_wpv6}/128\"]"
+        say "检测到原生双栈环境，开启双栈内网代理，Endpoint 调整为 IPv6 节点。"
+    else
+        # 纯 IPv4 环境下主动裁剪掉虚拟本端 IPv6，规避网关缺失引发的数据流泄露
+        say "检测到单单单栈 (IPv4) 环境，主动剥离虚拟 IPv6 地址，消除半断网隐患。"
+    fi
+
+    mkdir -p "$ETC_DIR"
+    cat > "${ETC_DIR}/warp_profile" <<EOF
+WARP_PVK="${final_pvk}"
+WARP_RES="${final_res}"
+WARP_ENDPOINT="${endpoint}"
+WARP_LOCAL_ADDR='${local_address_json}'
+EOF
+    ok "WARP 凭证状态库建立完成。"
 }
 
-# --- 4. 自适应套接字探测循环 (方案 2) ---
-wait_for_warp_port() {
-    say "验证 WARP 代理本地套接字状态 (自适应复查中)..."
-    local max_attempts=15
-    local attempt=0
-    while [ $attempt -lt $max_attempts ]; do
-        if ss -lnt 2>/dev/null | grep -q ":40000"; then
-            return 0  # 端口就绪
-        fi
-        sleep 2
-        attempt=$((attempt + 1))
-    done
-    return 1  # 超时未启动
-}
-
-# --- 5. 组件同步 ---
+# --- 3. 组件同步 ---
 get_sb_version() {
     local raw_json v
     raw_json=$(curl -sL --connect-timeout 10 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null)
@@ -186,14 +193,14 @@ create_env() {
         fi
         rm -f /tmp/sb.tar.gz
     else
-        err "Sing-box 下载失败"
+        err "下载 Sing-box 失败"
     fi
 
     chmod +x "${BIN_DIR}/"* || err "组件赋权失败"
     chown -R "$SERVICE_USER":"$SERVICE_USER" "$LIB_DIR" "$LOG_DIR" || err "权限归属分配失败"
 }
 
-# --- 6. 配置交互与感知分流模板 ---
+# --- 4. 配置写入 ---
 write_configs() {
     say "配置交互..."
     read -p "请输入隧道连接 Token: " token
@@ -204,6 +211,21 @@ write_configs() {
 
     local sb_port=$((RANDOM % 10000 + 40001))
     local m_port=$((RANDOM % 10000 + 30000))
+
+    local pvk res endpoint local_addr
+    if [ -f "${ETC_DIR}/warp_profile" ]; then
+        source "${ETC_DIR}/warp_profile"
+        pvk="$WARP_PVK"
+        res="$WARP_RES"
+        endpoint="$WARP_ENDPOINT"
+        local_addr="$WARP_LOCAL_ADDR"
+    fi
+
+    # 最终防御性赋值，绝不生成无效 JSON 字段
+    pvk=${pvk:-"52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A="}
+    res=${res:-"[215, 69, 233]"}
+    endpoint=${endpoint:-"162.159.192.1"}
+    local_addr=${local_addr:-'["172.16.0.2/32"]'}
 
     cat > "${ETC_DIR}/env" <<EOF
 WS_PORT=${ws_port}
@@ -220,21 +242,23 @@ EOF
         done
     fi
 
-    local warp_outbound
-    if wait_for_warp_port; then
-        warp_outbound='{"type": "socks", "tag": "warp", "server": "127.0.0.1", "server_port": 40000}'
-        ok "WARP 代理套接字检测就绪，流媒体分流已启用。"
-    else
-        warp_outbound='{"type": "direct", "tag": "warp"}'
-        say "警告: 未检测到本地 WARP 活动端口。已将分流路由降级为 [直连] 模式，防止网络黑洞。"
-    fi
-
+    # 生成安全的 Sing-box JSON，以数组对象形式直接解析 local_address (方案 1)
     cat > "${ETC_DIR}/singbox.json" <<EOF
 {
   "inbounds": [{"type": "socks", "listen": "127.0.0.1", "listen_port": ${sb_port}}],
   "outbounds": [
     {"type": "direct", "tag": "direct"},
-    ${warp_outbound}
+    {
+      "type": "wireguard",
+      "tag": "warp",
+      "server": "${endpoint}",
+      "server_port": 2408,
+      "local_address": ${local_addr},
+      "private_key": "${pvk}",
+      "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+      "reserved": ${res},
+      "mtu": 1420
+    }
   ],
   "route": { 
     "rules": [{"domain": [ ${domains} ], "outbound": "warp"}], 
@@ -244,13 +268,20 @@ EOF
 EOF
     chown -R root:"$SERVICE_USER" "$ETC_DIR"
     chmod 640 "${ETC_DIR}/"*
+
+    # 执行 Sing-box 语法校验哨兵机制 (方案 1)
+    say "正在进行配置文件语法哨兵级检测..."
+    if ! "${BIN_DIR}/singbox" check -c "${ETC_DIR}/singbox.json" >/dev/null 2>&1; then
+        err "Sing-box 语法检测未通过 (防护拦截：API 语法污染引发的 JSON Crash)。安装终止。"
+    fi
+    ok "语法检测通过。JSON 配置结构安全。"
 }
 
-# --- 7. Systemd 级联链路 ---
+# --- 5. Systemd 级联链路 ---
 write_units() {
-    say "部署 Systemd 强耦合链路..."
+    say "部署 Systemd 级联链路..."
 
-    # 1. Singbox (基础设施层)
+    # 1. Singbox
     cat > "/etc/systemd/system/${SB_SERVICE}" <<EOF
 [Unit]
 Description=NMU Singbox Base
@@ -307,7 +338,7 @@ EOF
     systemctl daemon-reload
 }
 
-# --- 8. 启动与日志诊断 ---
+# --- 6. 启动与日志诊断 ---
 start_all() {
     say "正在激活隧道链路..."
     systemctl daemon-reload
@@ -351,10 +382,8 @@ start_all() {
 case "${1:-help}" in
     install)
         require_root
-        # 方案 1：在执行期注册全局 trap，保障在任何意外退出时还原系统文件
-        trap cleanup_os_release EXIT INT TERM
         install_deps
-        setup_warp
+        get_warp_profile
         create_env
         write_configs
         write_units
