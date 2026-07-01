@@ -2,21 +2,19 @@
 set -euo pipefail
 
 # =========================================================
-#  suoha x-tunnel (NMU-Glitch 专属优化版)
-#  - 安全：100% 官方或个人仓库源，移除第三方镜像
-#  - 健壮：增加下载重试与连接超时保护
-#  - 干净：独立工作目录 $HOME/.suoha_x_tunnel
+#  suoha x-tunnel (NMU-Glitch 终极加固版 - 完整环境补全)
+#  - 补全：重新加入自动检测并安装依赖 (install_deps)
+#  - 安全：防止 pkill 误杀，锁定精确会话名称
+#  - 安全：使用环境变量传递参数，彻底消除命令注入漏洞
+#  - 兼容：修正 sudo + screen 环境冲突，定义独立 SCREENDIR
 # =========================================================
 
-# --- 配置区 ---
-WORK_DIR="${HOME}/.suoha_x_tunnel"
-CONFIG_FILE="${WORK_DIR}/suoha_tunnel_config"
-MY_GITHUB_REPO="nmu-glitch/my-tunnels"
-MY_TAG="v1.0.0"
-
-# 建立工作目录
-mkdir -p "$WORK_DIR"
-cd "$WORK_DIR"
+# --- 环境常量 ---
+SERVICE_USER="nmu-tunnel"
+SCREEN_NAME_PREFIX="nmu_tunnel_"
+S_X_TUNNEL="${SCREEN_NAME_PREFIX}xtunnel"
+S_ARGO="${SCREEN_NAME_PREFIX}argo"
+S_SINGBOX="${SCREEN_NAME_PREFIX}singbox"
 
 # 颜色定义
 RED='\033[0;31m'
@@ -25,242 +23,181 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# ------------- 辅助函数 -------------
 say() { printf "${BLUE}[NMU-Tunnel]${NC} %s\n" "$*"; }
 say_ok() { printf "${GREEN}[OK]${NC} %s\n" "$*"; }
 say_warn() { printf "${YELLOW}[WARN]${NC} %s\n" "$*"; }
 say_err() { printf "${RED}[FAIL]${NC} %s\n" "$*"; }
 
-# 自动检测包管理器
-detect_package_manager() {
-  if command -v apt-get &>/dev/null; then
-    INSTALL_CMD="apt-get -y install"
-    UPDATE_CMD="apt-get update"
-  elif command -v apk &>/dev/null; then
-    INSTALL_CMD="apk add --no-cache"
-    UPDATE_CMD="apk update"
-  elif command -v dnf &>/dev/null; then
-    INSTALL_CMD="dnf -y install"
-    UPDATE_CMD="dnf check-update"
-  elif command -v yum &>/dev/null; then
-    INSTALL_CMD="yum -y install"
-    UPDATE_CMD="yum makecache"
-  else
-    INSTALL_CMD="apt-get -y install"
-    UPDATE_CMD="apt-get update"
-  fi
-}
-
-need_cmd() {
-  local cmd="$1"
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    say "正在安装依赖工具: $cmd ..."
-    $UPDATE_CMD >/dev/null 2>&1 || true
-    $INSTALL_CMD "$cmd" >/dev/null 2>&1 || true
-  fi
-}
-
-get_free_port() {
-  while true; do
-    local port=$((RANDOM % 64512 + 1024))
-    if ! ss -lnt | grep -qE ":${port}$"; then
-      echo "$port"; return
+# --- 1. 依赖安装函数 (Root 权限) ---
+install_deps() {
+    if [ "$(id -u)" -ne 0 ]; then
+        say_warn "当前是非 Root 用户，如果脚本运行失败，请先手动安装依赖: screen, curl, iproute2, sudo, tar"
+        return
     fi
-  done
-}
 
-stop_screen() {
-  local name="$1"
-  screen -S "$name" -X quit >/dev/null 2>&1 || true
-  sleep 0.5
-}
-
-download_bin() {
-  local url="$1" out="$2"
-  if [[ ! -f "$out" ]]; then
-    say "正在下载 $out ..."
-    if ! curl -fsSL --connect-timeout 10 --retry 3 "$url" -o "$out"; then
-      say_err "下载失败: $url"
-      exit 1
-    fi
-    chmod +x "$out"
-  fi
-}
-
-# ------------- 自检诊断 -------------
-self_check() {
-  local bind_domain="${1:-}"
-  local try_domain="${2:-}"
-  local wsport="${3:-}"
-  echo
-  say "=============================="
-  say " 自检诊断报告"
-  say "=============================="
-  if [[ -n "$wsport" ]]; then
-    if ss -lntp 2>/dev/null | grep -q ":${wsport}"; then
-      say_ok "本地监听状态: 127.0.0.1:${wsport} (正常)"
+    say "正在检查并初始化系统依赖环境..."
+    if command -v apt-get &>/dev/null; then
+        apt-get update && apt-get -y install screen curl iproute2 sudo tar sed grep
+    elif command -v apk &>/dev/null; then
+        apk update && apk add --no-cache screen curl iproute2 sudo tar sed grep bash
+    elif command -v dnf &>/dev/null; then
+        dnf -y install screen curl iproute2 sudo tar sed grep
+    elif command -v yum &>/dev/null; then
+        yum -y install screen curl iproute2 sudo tar sed grep
     else
-      say_err "本地监听状态: 未找到端口 ${wsport} (异常)"
+        say_err "未检测到支持的包管理器，请手动安装 screen, curl, sudo。"
     fi
-  fi
-  
-  if [[ -n "$bind_domain" ]]; then
-    say "域名检查 [${bind_domain}]:"
-    if curl -I --connect-timeout 3 "https://${bind_domain}" 2>/dev/null | grep -q "HTTP/"; then
-      say_ok "  - 网络访问: 正常"
+}
+
+# --- 2. 环境初始化 (用户与目录) ---
+setup_env() {
+    if [ "$(id -u)" -eq 0 ]; then
+        if ! id "$SERVICE_USER" &>/dev/null; then
+            say "正在创建专用安全用户: $SERVICE_USER ..."
+            useradd -m -s /usr/sbin/nologin "$SERVICE_USER" || useradd -m -s /bin/false "$SERVICE_USER"
+        fi
+        USER_HOME=$(eval echo "~$SERVICE_USER")
     else
-      say_err "  - 网络访问: 失败 (请检查 CF Tunnel 状态)"
+        SERVICE_USER=$(whoami)
+        USER_HOME="$HOME"
     fi
-  fi
+    
+    WORK_DIR="$USER_HOME/.suoha_x_tunnel"
+    # 定义私有的 Screen Socket 目录，解决跨用户启动权限问题
+    SCREEN_DIR="$WORK_DIR/.screen"
+    
+    [ "$(id -u)" -eq 0 ] && mkdir -p "$WORK_DIR" && chown "$SERVICE_USER":"$SERVICE_USER" "$WORK_DIR"
+    mkdir -p "$SCREEN_DIR"
+    chmod 700 "$WORK_DIR" "$SCREEN_DIR"
 }
 
-save_config() {
-  {
-    echo "wsport=${wsport:-}"
-    echo "metricsport=${metricsport:-}"
-    echo "try_domain=${TRY_DOMAIN:-}"
-    echo "bind_enable=${bind_enable:-0}"
-    echo "bind_domain=${bind_domain:-}"
-    echo "token=${token:-}"
-  } > "$CONFIG_FILE"
+# --- 3. 封装安全的跨用户执行 ---
+safe_run() {
+    local cmd="$1"
+    # 环境变量传参，消除命令注入风险
+    export EX_WS_PORT="${wsport:-}"
+    export EX_METRICS_PORT="${metricsport:-}"
+    export EX_TOKEN="${token:-}"
+    export EX_IPS="${ips:-4}"
+    export SCREENDIR="$SCREEN_DIR" 
+
+    if [ "$(id -u)" -eq 0 ]; then
+        # --preserve-env 确保自定义的环境变量能穿透到 sudo 内部
+        sudo -u "$SERVICE_USER" --preserve-env=EX_WS_PORT,EX_METRICS_PORT,EX_TOKEN,EX_IPS,SCREENDIR,TERM \
+            bash -c "cd $WORK_DIR && $cmd"
+    else
+        bash -c "cd $WORK_DIR && $cmd"
+    fi
 }
 
-load_config() {
-  if [[ -f "$CONFIG_FILE" ]]; then
-    # shellcheck source=/dev/null
-    source "$CONFIG_FILE"
-    return 0
-  else
-    return 1
-  fi
+# --- 4. 进程精确管理 ---
+stop_services() {
+    say "清理旧的进程会话..."
+    local sessions=("$S_X_TUNNEL" "$S_ARGO" "$S_SINGBOX")
+    for s in "${sessions[@]}"; do
+        if [ "$(id -u)" -eq 0 ]; then
+            sudo -u "$SERVICE_USER" env SCREENDIR="$SCREEN_DIR" screen -S "$s" -X quit >/dev/null 2>&1 || true
+        else
+            SCREENDIR="$SCREEN_DIR" screen -S "$s" -X quit >/dev/null 2>&1 || true
+        fi
+    done
 }
 
-# ------------- 核心逻辑 -------------
+# --- 5. 核心业务逻辑 ---
 quicktunnel() {
-  local arch
-  case "$(uname -m)" in
-    x86_64|x64|amd64) arch="amd64" ;;
-    armv8|arm64|aarch64) arch="arm64" ;;
-    i386|i686) arch="386" ;;
-    *) say_err "不支持的架构"; exit 1 ;;
-  esac
+    local arch
+    case "$(uname -m)" in
+        x86_64|x64|amd64) arch="amd64" ;;
+        armv8|arm64|aarch64) arch="arm64" ;;
+        *) say_err "不支持架构 $(uname -m)"; exit 1 ;;
+    esac
 
-  # 1. 下载 x-tunnel (来自你的仓库)
-  download_bin "https://github.com/${MY_GITHUB_REPO}/releases/download/${MY_TAG}/x-tunnel-linux-${arch}" "x-tunnel-linux"
-  
-  # 2. 下载依赖 (固定官方版本链接，防止 404)
-  # 注意：如果以后你把这两个也传到自己仓库，直接改下面链接即可
-  download_bin "https://github.com/Snawoot/opera-proxy/releases/download/v1.1.2/opera-proxy.linux-${arch}" "opera-linux"
-  download_bin "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}" "cloudflared-linux"
+    # 停止已有服务
+    stop_services
 
-  # 端口冲突检查
-  if [[ -n "${wsport:-}" ]] && ss -lnt | grep -qE ":${wsport}$"; then
-    say_err "端口 ${wsport} 已被占用！"
-    exit 1
-  fi
+    # 下载所需二进制
+    say "正在下载核心组件..."
+    safe_run "
+        curl -fsSL https://github.com/nmu-glitch/my-tunnels/releases/download/v1.0.0/x-tunnel-linux-$arch -o xtunnel
+        curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$arch -o cloudflared
+        curl -fsSL https://github.com/Snawoot/sing-box-static/releases/latest/download/sing-box-linux-$arch -o singbox
+        chmod 700 xtunnel cloudflared singbox
+    "
 
-  # 启动 Opera
-  if [[ "${opera:-0}" == "1" ]]; then
-    operaport="$(get_free_port)"
-    screen -dmUS opera ./opera-linux -country "$country" -socks-mode -bind-address "127.0.0.1:${operaport}"
-    sleep 1
-  fi
+    wsport=$((RANDOM % 50000 + 10000))
+    metricsport=$((RANDOM % 50000 + 10000))
 
-  # 启动 x-tunnel
-  wsport="${wsport:-$(get_free_port)}"
-  local token_cmd=""
-  [[ -n "${token:-}" ]] && token_cmd="-token $token"
-  local forward_cmd=""
-  [[ "${opera:-0}" == "1" ]] && forward_cmd="-f socks5://127.0.0.1:${operaport}"
+    # 生成配置并启动
+    say "正在启动智能分流代理系统..."
+    safe_run "
+        cat > sb.json <<EOF
+{
+  \"inbounds\": [{\"type\": \"socks\", \"listen\": \"127.0.0.1\", \"listen_port\": 50000}],
+  \"outbounds\": [
+    {\"type\": \"direct\", \"tag\": \"direct\"},
+    {\"type\": \"socks\", \"tag\": \"warp\", \"server\": \"127.0.0.1\", \"server_port\": 40000}
+  ],
+  \"route\": { 
+    \"rules\": [{\"domain\": [\"netflix.com\",\"chatgpt.com\",\"openai.com\"], \"outbound\": \"warp\"}], 
+    \"final\": \"direct\" 
+  }
+}
+EOF
+        # 按照链路顺序启动进程
+        screen -dmUS $S_SINGBOX ./singbox run -c sb.json
+        screen -dmUS $S_X_TUNNEL ./xtunnel -l 127.0.0.1:\$EX_WS_PORT -token \"\$EX_TOKEN\" -f socks5://127.0.0.1:50000
+        screen -dmUS $S_ARGO ./cloudflared tunnel --edge-ip-version \$EX_IPS --protocol http2 --url 127.0.0.1:\$EX_WS_PORT --metrics 127.0.0.1:\$EX_METRICS_PORT
+    "
 
-  screen -dmUS x-tunnel ./x-tunnel-linux -l "ws://127.0.0.1:${wsport}" $token_cmd $forward_cmd
+    say "正在等待 Cloudflare 分配安全隧道域名..."
+    sleep 15
+    TRY_DOMAIN=$(safe_run "curl -s http://127.0.0.1:$metricsport/metrics" | grep 'userHostname=' | sed -E 's/.*userHostname="https?:\/\/([^"]+)".*/\1/' | head -n1 || true)
 
-  # 启动 Cloudflared (Argo)
-  metricsport="$(get_free_port)"
-  screen -dmUS argo ./cloudflared-linux --edge-ip-version "$ips" --protocol http2 tunnel \
-    --url "127.0.0.1:${wsport}" --metrics "0.0.0.0:${metricsport}"
-
-  # 启动 Named Tunnel (如果有)
-  if [[ "${bind_enable:-0}" == "1" && -n "${cf_tunnel_token:-}" ]]; then
-    screen -dmUS cfbind ./cloudflared-linux --edge-ip-version "$ips" tunnel run --token "$cf_tunnel_token"
-  fi
-
-  # 获取临时域名
-  say "正在获取 Cloudflare 临时域名 (约需 10-30 秒)..."
-  TRY_DOMAIN=""
-  for _ in $(seq 1 30); do
-    RESP="$(curl -s --connect-timeout 2 "http://127.0.0.1:${metricsport}/metrics" || true)"
-    if echo "$RESP" | grep -q 'userHostname='; then
-      TRY_DOMAIN="$(echo "$RESP" | grep 'userHostname="' | sed -E 's/.*userHostname="https?:\/\/([^"]+)".*/\1/' | head -n1)"
-      break
-    fi
-    sleep 1
-  done
-
-  save_config
-  clear
-  say_ok "启动完成！"
-  [[ -n "$TRY_DOMAIN" ]] && say "临时域名: https://${TRY_DOMAIN}"
-  [[ -n "${bind_domain:-}" ]] && say "绑定域名: https://${bind_domain}"
-  say "本地端口: ${wsport}  |  Token: ${token:-无}"
-  
-  self_check "${bind_domain:-}" "${TRY_DOMAIN:-}" "${wsport}"
+    clear
+    say_ok "系统启动成功！"
+    say "----------------------------------"
+    say "运行状态: 环境已加固 & 权限已隔离"
+    say "运行用户: $SERVICE_USER"
+    say "临时域名: https://${TRY_DOMAIN:-域名获取慢，请稍后手动检查}"
+    say "分流策略: 默认 Netflix/ChatGPT 走 WARP(40000)"
+    say "----------------------------------"
 }
 
-# ------------- 菜单界面 -------------
-detect_package_manager
-need_cmd screen
-need_cmd curl
-need_cmd ss
-need_cmd grep
+# --- 执行入口 ---
+# 1. 首先确保安装了所有必要工具
+install_deps
+# 2. 初始化运行环境
+setup_env
 
 clear
 say "=================================================="
-say "         NMU-Glitch 极速隧道管理面板             "
-say "  - 源: GitHub (nmu-glitch/my-tunnels)            "
+say "      NMU-Glitch 终极安全代理管理面板           "
 say "=================================================="
-echo " 1. 梭哈模式 (安装并运行)"
-echo " 2. 停止所有服务"
-echo " 3. 清空缓存并卸载"
-echo " 4. 查看当前配置与状态"
+echo " 1. 梭哈：一键开启智能分流代理"
+echo " 2. 停止服务"
+echo " 3. 卸载环境 (物理删除)"
 echo " 0. 退出"
-read -p "选择 [0-4]: " mode
+read -p "请选择操作 [0-3]: " mode
 mode="${mode:-1}"
 
 case "$mode" in
-  1)
-    read -p "是否启用 Opera 前置代理? (0.关[默认], 1.开): " opera
-    opera="${opera:-0}"
-    [[ "$opera" == "1" ]] && { read -p "区域代码 (AM/AS/EU, 默认AM): " country; country=${country:-AM}; }
-    read -p "IP 协议 (4.IPv4[默认], 6.IPv6): " ips; ips=${ips:-4}
-    read -p "设置 Token (验证密码): " token
-    read -p "是否固定端口? (0.随机, 1.固定): " fixp
-    [[ "${fixp:-0}" == "1" ]] && { read -p "端口号 (默认12345): " wsport; wsport=${wsport:-12345}; }
-    read -p "启用 Named Tunnel 域名绑定? (0.不启用, 1.启用): " bind_enable
-    if [[ "${bind_enable:-0}" == "1" ]]; then
-      read -p "输入 Cloudflare Tunnel Token: " cf_tunnel_token
-      read -p "输入你的域名 (仅供记录): " bind_domain
-    fi
-    stop_screen x-tunnel; stop_screen argo; stop_screen opera; stop_screen cfbind
-    quicktunnel
-    ;;
-  2)
-    stop_screen x-tunnel; stop_screen argo; stop_screen opera; stop_screen cfbind
-    rm -f "$CONFIG_FILE"
-    say_ok "服务已停止。"
-    ;;
-  3)
-    stop_screen x-tunnel; stop_screen argo; stop_screen opera; stop_screen cfbind
-    rm -rf "$WORK_DIR"
-    say_ok "工作目录已清除。"
-    ;;
-  4)
-    if load_config; then
-       say "配置信息: 端口 ${wsport}, 域名 ${bind_domain:-无}, 临时 ${try_domain:-无}"
-       self_check "${bind_domain:-}" "${try_domain:-}" "${wsport:-}"
-    else
-       say_warn "没有运行中的记录。"
-    fi
-    ;;
-  *) exit 0 ;;
+    1)
+        read -p "设置 Token (留空则不设): " token
+        read -p "IP 协议版本 (4/6, 默认4): " ips; ips=${ips:-4}
+        quicktunnel
+        ;;
+    2)
+        stop_services
+        say_ok "所有服务已通过精确 Session 匹配停止。"
+        ;;
+    3)
+        stop_services
+        if [ "$(id -u)" -eq 0 ]; then
+            userdel -r "$SERVICE_USER" 2>/dev/null || rm -rf "$WORK_DIR"
+        else
+            rm -rf "$WORK_DIR"
+        fi
+        say_ok "系统环境已彻底物理卸载。"
+        ;;
+    *) exit 0 ;;
 esac
