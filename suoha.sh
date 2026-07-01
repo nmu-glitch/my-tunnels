@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# NMU Tunnel V11.1 - 生产级原生抗断网自愈版
-# - 修复：基于强正则表达式防断裂提取 + Sing-box JSON 语法哨兵，彻底免疫配置破碎崩溃 (方案 1)
-# - 修复：引入双栈网络探测，针对单 IPv4 宿主机自动裁剪隧道，防止 IPv6 泄露半断网黑洞 (方案 2)
+# NMU Tunnel V11.4 - 终极无阻版
+# - 修复：引入 VFS 目录项重命名避让机制，利用 mv 原子重命名解决内核 D 状态 (D-State) 进程物理锁死问题
+# - 修复：动态版本探针，避开 GitHub API 速率限制
+# - 修复：无依赖进程切断引擎
+# - 修复：Wireguard-WARP 单/双栈自适应过滤与语法哨兵检测
 # =========================================================
 
 APP_NAME="nmu-tunnel"
@@ -17,7 +19,7 @@ SB_SERVICE="nmu-singbox.service"
 XT_SERVICE="nmu-xtunnel.service"
 CF_SERVICE="nmu-cloudflared.service"
 
-say() { echo -e "\033[0;34m[NMU-V11.1]\033[0m $*"; }
+say() { echo -e "\033[0;34m[NMU-V11.4]\033[0m $*"; }
 ok() { echo -e "\033[0;32m[OK]\033[0m $*"; }
 err() { echo -e "\033[0;31m[ERROR]\033[0m $*"; exit 1; }
 
@@ -69,27 +71,22 @@ install_deps() {
     fi
 }
 
-# --- 2. 强正则凭证提取与自适应栈探测 (方案 1 + 方案 2) ---
+# --- 2. 强正则凭证提取与自适应栈探测 ---
 get_warp_profile() {
     say "正在向公网生成器获取官方 WARP 原生凭证..."
     local warpurl raw_pvk raw_wpv6 raw_res
     
-    # 获取原始数据
     warpurl=$(curl -sm6 -k https://warp.xijp.eu.org 2>/dev/null || wget --tries=2 -qO- https://warp.xijp.eu.org 2>/dev/null || true)
     
-    # 彻底滤除换行符、多余双引号与空白
     warpurl=$(echo "$warpurl" | tr -d '\r' | tr -d '"')
     
-    # 采用强正则模式防御性提取，杜绝全角/半角切割失效问题 (方案 1)
     raw_pvk=$(echo "$warpurl" | grep -i "Private_key" | grep -oE "[A-Za-z0-9+/]{43}=" | head -n1 || true)
     raw_wpv6=$(echo "$warpurl" | grep -i "IPV6" | grep -oE "([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}" | head -n1 || true)
     if [[ -z "$raw_wpv6" ]]; then
-        # 兼容简写或非标准格式的 IPv6
         raw_wpv6=$(echo "$warpurl" | grep -i "IPV6" | grep -oE "([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}" | head -n1 || true)
     fi
     raw_res=$(echo "$warpurl" | grep -i "reserved" | grep -oE "\[[0-9]+,\s*[0-9]+,\s*[0-9]+\]" | head -n1 || true)
 
-    # 规范化清理
     raw_pvk=$(echo "$raw_pvk" | xargs || true)
     raw_wpv6=$(echo "$raw_wpv6" | xargs || true)
     raw_res=$(echo "$raw_res" | xargs || true)
@@ -98,7 +95,6 @@ get_warp_profile() {
     local wpv6_valid=false
     local res_valid=false
 
-    # 格式规范性硬性校验
     [[ "$raw_pvk" =~ ^[A-Za-z0-9+/]{43}=$ ]] && pvk_valid=true
     [[ "$raw_wpv6" =~ ^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$ ]] && wpv6_valid=true
     [[ "$raw_res" =~ ^\[[0-9]+,\s*[0-9]+,\s*[0-9]+\]$ ]] && res_valid=true
@@ -117,7 +113,6 @@ get_warp_profile() {
         final_res="[215, 69, 233]"
     fi
 
-    # 独立探测双栈连通性，裁剪虚拟路由防止 IPv6 半断网黑洞 (方案 2)
     local has_v6=false
     if curl -s6m3 https://icanhazip.com >/dev/null 2>&1; then
         has_v6=true
@@ -127,12 +122,10 @@ get_warp_profile() {
     local local_address_json='["172.16.0.2/32"]'
 
     if [ "$has_v6" = "true" ]; then
-        # 仅对存在物理双栈网络环境的宿主机开启双栈 Wireguard 路由
         endpoint="[2606:4700:d0::a29f:c001]"
         local_address_json="[\"172.16.0.2/32\", \"${final_wpv6}/128\"]"
         say "检测到原生双栈环境，开启双栈内网代理，Endpoint 调整为 IPv6 节点。"
     else
-        # 纯 IPv4 环境下主动裁剪掉虚拟本端 IPv6，规避网关缺失引发的数据流泄露
         say "检测到单单单栈 (IPv4) 环境，主动剥离虚拟 IPv6 地址，消除半断网隐患。"
     fi
 
@@ -146,10 +139,36 @@ EOF
     ok "WARP 凭证状态库建立完成。"
 }
 
-# --- 3. 组件同步 ---
+# --- 3. 进程原生切断器 & 动态版本探针 ---
+kill_process_native() {
+    local proc_patterns=("cloudflared" "xtunnel" "singbox")
+    for pattern in "${proc_patterns[@]}"; do
+        pkill -9 -f "$pattern" >/dev/null 2>&1 || true
+        local pids
+        pids=$(ps -ef 2>/dev/null | grep "$pattern" | grep -v grep | awk '{print $2}' || true)
+        if [[ -n "$pids" ]]; then
+            echo "$pids" | xargs kill -9 >/dev/null 2>&1 || true
+        fi
+    done
+}
+
+get_local_sb_version() {
+    if [[ -x "${BIN_DIR}/singbox" ]]; then
+        local v
+        v=$("${BIN_DIR}/singbox" version 2>/dev/null | awk '/sing-box version/{print $3}' | head -n1 || true)
+        v=$(echo "$v" | tr -d '\r' | xargs || true)
+        if [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "$v"
+            return 0
+        fi
+    fi
+    echo ""
+    return 1
+}
+
 get_sb_version() {
     local raw_json v
-    raw_json=$(curl -sL --connect-timeout 10 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null)
+    raw_json=$(curl -sL --connect-timeout 4 --max-time 8 -H "User-Agent: Mozilla/5.0" https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null || true)
     if [ -z "$raw_json" ]; then
         echo ""
         return
@@ -164,6 +183,11 @@ get_sb_version() {
 
 create_env() {
     say "同步核心二进制组件..."
+    
+    # 1. 关停宿主机服务
+    systemctl stop "$CF_SERVICE" "$XT_SERVICE" "$SB_SERVICE" >/dev/null 2>&1 || true
+    kill_process_native
+    
     id "$SERVICE_USER" >/dev/null 2>&1 || useradd -r -m -d "$LIB_DIR" -s /usr/sbin/nologin "$SERVICE_USER" || err "用户创建失败"
     mkdir -p "$ETC_DIR" "$BIN_DIR" "$LOG_DIR" || err "目录初始化失败"
 
@@ -172,28 +196,51 @@ create_env() {
         ARCH="arm64"
     fi
     
+    # 2. VFS 原子重命名避让机制：移走可能陷入 D 状态或忙锁定的旧文件，开辟全新槽位，后台异步清理旧文件
+    for bin_file in xtunnel cloudflared singbox sing-box; do
+        if [[ -f "${BIN_DIR}/${bin_file}" ]]; then
+            mv -f "${BIN_DIR}/${bin_file}" "${BIN_DIR}/${bin_file}.old" >/dev/null 2>&1 || true
+            rm -f "${BIN_DIR}/${bin_file}.old" >/dev/null 2>&1 &
+        fi
+    done
+    
+    # 3. 采用 /tmp 原子下载机制 + 原子重命名覆盖
     say "正在同步 xtunnel 核心..."
-    curl -fL --retry 3 "https://github.com/nmu-glitch/my-tunnels/releases/download/v1.0.0/x-tunnel-linux-${ARCH}" -o "${BIN_DIR}/xtunnel" || err "xtunnel 下载失败"
+    curl -fL --retry 3 "https://github.com/nmu-glitch/my-tunnels/releases/download/v1.0.0/x-tunnel-linux-${ARCH}" -o "/tmp/xtunnel" || err "xtunnel 下载失败"
+    mv -f "/tmp/xtunnel" "${BIN_DIR}/xtunnel"
     
     say "正在同步 cloudflared 核心..."
-    curl -fL --retry 3 "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}" -o "${BIN_DIR}/cloudflared" || err "cloudflared 下载失败"
+    curl -fL --retry 3 "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}" -o "/tmp/cloudflared" || err "cloudflared 下载失败"
+    mv -f "/tmp/cloudflared" "${BIN_DIR}/cloudflared"
     
+    # 4. 动态本地版本探针
     local SB_VER
-    SB_VER=$(get_sb_version)
-    if [[ -z "$SB_VER" ]]; then
-        SB_VER="1.8.11"
-        say "无法解析最新 Sing-box 版本，自动启用安全备用版本: v${SB_VER}"
+    SB_VER=$(get_local_sb_version)
+    if [[ -n "$SB_VER" ]]; then
+        say "检测到本地已存在 Sing-box v${SB_VER}，复用本地版本以避开 GitHub API 速率风控。"
+    else
+        say "未检测到本地版本，正在请求远程 GitHub API 获取最新版本号..."
+        SB_VER=$(get_sb_version)
+        if [[ -z "$SB_VER" ]]; then
+            SB_VER="1.8.11"
+            say "GitHub API 响应超限，启用安全备用版本: v${SB_VER}"
+        else
+            say "获取到最新 Sing-box 版本: v${SB_VER}"
+        fi
     fi
     
-    say "正在下载 Sing-box v${SB_VER}..."
-    if curl -fL --retry 3 "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${ARCH}.tar.gz" -o /tmp/sb.tar.gz; then
-        tar -zxf /tmp/sb.tar.gz --strip-components=1 -C "${BIN_DIR}" || err "Sing-box 解压失败"
-        if [[ -f "${BIN_DIR}/sing-box" ]]; then
-            mv "${BIN_DIR}/sing-box" "${BIN_DIR}/singbox"
+    # 5. 如果本地版本不一致或不存在，执行拉取覆盖
+    if [[ ! -x "${BIN_DIR}/singbox" ]] || [[ "$SB_VER" != "$(get_local_sb_version)" ]]; then
+        say "正在下载安装 Sing-box v${SB_VER}..."
+        if curl -fL --retry 3 "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${ARCH}.tar.gz" -o /tmp/sb.tar.gz; then
+            tar -zxf /tmp/sb.tar.gz --strip-components=1 -C "${BIN_DIR}" || err "Sing-box 解压失败"
+            if [[ -f "${BIN_DIR}/sing-box" ]]; then
+                mv -f "${BIN_DIR}/sing-box" "${BIN_DIR}/singbox"
+            fi
+            rm -f /tmp/sb.tar.gz
+        else
+            err "下载 Sing-box 失败"
         fi
-        rm -f /tmp/sb.tar.gz
-    else
-        err "下载 Sing-box 失败"
     fi
 
     chmod +x "${BIN_DIR}/"* || err "组件赋权失败"
@@ -221,7 +268,6 @@ write_configs() {
         local_addr="$WARP_LOCAL_ADDR"
     fi
 
-    # 最终防御性赋值，绝不生成无效 JSON 字段
     pvk=${pvk:-"52cuYFgCJXp0LAq7+nWJIbCXXgU9eGggOc+Hlfz5u6A="}
     res=${res:-"[215, 69, 233]"}
     endpoint=${endpoint:-"162.159.192.1"}
@@ -242,7 +288,6 @@ EOF
         done
     fi
 
-    # 生成安全的 Sing-box JSON，以数组对象形式直接解析 local_address (方案 1)
     cat > "${ETC_DIR}/singbox.json" <<EOF
 {
   "inbounds": [{"type": "socks", "listen": "127.0.0.1", "listen_port": ${sb_port}}],
@@ -269,7 +314,7 @@ EOF
     chown -R root:"$SERVICE_USER" "$ETC_DIR"
     chmod 640 "${ETC_DIR}/"*
 
-    # 执行 Sing-box 语法校验哨兵机制 (方案 1)
+    # 执行 Sing-box 语法校验哨兵机制
     say "正在进行配置文件语法哨兵级检测..."
     if ! "${BIN_DIR}/singbox" check -c "${ETC_DIR}/singbox.json" >/dev/null 2>&1; then
         err "Sing-box 语法检测未通过 (防护拦截：API 语法污染引发的 JSON Crash)。安装终止。"
