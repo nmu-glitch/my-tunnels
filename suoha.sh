@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# =========================================================
-# NMU Tunnel V9.2 - 健壮修复版
-# =========================================================
 set -eo pipefail
+
+# =========================================================
+# NMU Tunnel V9.4 - 旗舰稳健版
+# - 修复：改用 pgrep 实现无依赖包管理器锁检测
+# - 修复：增强 GitHub API 版本号解析逻辑
+# - 修复：完善 Systemd [Install] 块与生命周期联动 (PartOf)
+# =========================================================
 
 APP_NAME="nmu-tunnel"
 SERVICE_USER="nmu-tunnel"
@@ -10,56 +14,67 @@ ETC_DIR="/etc/${APP_NAME}"
 LIB_DIR="/var/lib/${APP_NAME}"
 BIN_DIR="${LIB_DIR}/bin"
 LOG_DIR="/var/log/${APP_NAME}"
-SCRIPT_DIR="/usr/local/lib/${APP_NAME}"
 
+SB_SERVICE="nmu-singbox.service"
 XT_SERVICE="nmu-xtunnel.service"
 CF_SERVICE="nmu-cloudflared.service"
-SB_SERVICE="nmu-singbox.service"
 
-say() { echo -e "[NMU-V9.2] $*"; }
-err() { echo -e "[ERROR] $*"; exit 1; }
+say() { echo -e "\033[0;34m[NMU-V9.4]\033[0m $*"; }
+err() { echo -e "\033[0;31m[ERROR]\033[0m $*"; exit 1; }
 
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
-        err "请使用 root 执行：sudo $0 install"
+        err "请使用 root 权限执行此脚本 (sudo)"
     fi
+}
+
+# --- 1. 无依赖包管理器锁检测 ---
+wait_for_apt() {
+    local count=0
+    # 检测常见包管理器进程，无需 fuser 依赖
+    while pgrep -x "apt|apt-get|dpkg|unattended-upgr" >/dev/null 2>&1; do
+        if [ $count -eq 0 ]; then say "检测到系统后台正在更新，脚本已进入排队状态..."; fi
+        sleep 5
+        ((count++))
+        if [ $count -gt 120 ]; then err "等待包管理器释放超时 (10分钟)，请手动检查。"; fi
+    done
 }
 
 install_deps() {
-    say "正在安装系统依赖，请稍候..."
-    # 强制清理可能存在的 apt 锁
+    say "同步环境依赖..."
+    wait_for_apt
     if command -v apt-get >/dev/null 2>&1; then
-        rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/lib/dpkg/lock* || true
-        apt-get update -y || say "警告: apt-get update 失败，尝试继续安装..."
-        apt-get install -y curl ca-certificates iproute2 file tar gzip psmisc || err "依赖安装失败"
+        apt-get update -y
+        apt-get install -y curl ca-certificates iproute2 file tar gzip
     elif command -v apk >/dev/null 2>&1; then
-        apk add --no-cache curl ca-certificates iproute2 file tar gzip psmisc bash
+        apk add --no-cache curl ca-certificates iproute2 file tar gzip bash
     fi
 }
 
-setup_warp() {
-    if ss -lnt | grep -q ":40000"; then
-        say "WARP 已就绪。"
-        return
+# --- 2. 稳健获取远程版本 ---
+get_sb_version() {
+    local version
+    version=$(curl -sL --connect-timeout 10 https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/' || echo "")
+    if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        err "获取 Sing-box 版本失败，请检查网络或 GitHub API 限制。"
     fi
-    say "自动部署官方 WARP SOCKS5..."
-    curl -fsSL https://raw.githubusercontent.com/P3TERX/warp.sh/main/warp.sh -o /tmp/warp.sh && chmod +x /tmp/warp.sh
-    /tmp/warp.sh s5 -p 40000 || say "WARP 安装可能不完整，请稍后检查"
+    echo "$version"
 }
 
 create_env() {
-    say "初始化运行环境..."
+    say "同步最新二进制组件..."
     id "$SERVICE_USER" >/dev/null 2>&1 || useradd -r -m -d "$LIB_DIR" -s /usr/sbin/nologin "$SERVICE_USER"
-    mkdir -p "$ETC_DIR" "$BIN_DIR" "$LOG_DIR" "$SCRIPT_DIR"
+    mkdir -p "$ETC_DIR" "$BIN_DIR" "$LOG_DIR"
 
     ARCH="amd64"; [[ "$(uname -m)" != "x86_64" ]] && ARCH="arm64"
     
-    say "下载核心组件 ($ARCH)..."
-    curl -fL "https://github.com/nmu-glitch/my-tunnels/releases/download/v1.0.0/x-tunnel-linux-${ARCH}" -o "${BIN_DIR}/xtunnel"
-    curl -fL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}" -o "${BIN_DIR}/cloudflared"
+    # 核心组件下载
+    curl -fL --retry 3 --connect-timeout 10 "https://github.com/nmu-glitch/my-tunnels/releases/download/v1.0.0/x-tunnel-linux-${ARCH}" -o "${BIN_DIR}/xtunnel"
+    curl -fL --retry 3 --connect-timeout 10 "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}" -o "${BIN_DIR}/cloudflared"
     
-    SB_VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep tag_name | cut -d ":" -f2 | tr -d '\"v ,')
-    curl -fL "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${ARCH}.tar.gz" -o /tmp/sb.tar.gz
+    SB_VER=$(get_sb_version)
+    say "获取到 Sing-box 最新版本: v$SB_VER"
+    curl -fL --retry 3 "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-${ARCH}.tar.gz" -o /tmp/sb.tar.gz
     tar -zxf /tmp/sb.tar.gz --strip-components=1 -C "${BIN_DIR}"
     [ -f "${BIN_DIR}/sing-box" ] && mv "${BIN_DIR}/sing-box" "${BIN_DIR}/singbox"
 
@@ -67,13 +82,14 @@ create_env() {
     chown -R "$SERVICE_USER":"$SERVICE_USER" "$LIB_DIR" "$LOG_DIR"
 }
 
+# --- 3. 配置交互 ---
 write_configs() {
-    say "--- 配置交互 ---"
-    read -p "请输入 xtunnel Token: " token
+    say "配置参数交互..."
+    read -p "请输入隧道 Token: " token
     [ -z "$token" ] && err "Token 不能为空"
-    read -p "本地监听端口 (默认 56908): " ws_port; ws_port=${ws_port:-56908}
-    read -p "CF Tunnel Token (留空则使用临时域名): " cf_token
-    read -p "分流域名 (除默认外，逗号隔开): " extra_domains
+    read -p "监听端口 (默认 56908): " ws_port; ws_port=${ws_port:-56908}
+    read -p "CF Tunnel Token (留空则用临时域名): " cf_token
+    read -p "额外分流域名 (逗号隔开): " extra_domains
 
     local sb_port=$((RANDOM % 10000 + 40001))
     local metrics_port=$((RANDOM % 10000 + 30000))
@@ -100,62 +116,95 @@ EOF
     chmod 640 "${ETC_DIR}/"*
 }
 
+# --- 4. 完善 Systemd 强联动链 ---
 write_units() {
+    say "部署 systemd 联动服务链..."
+    
+    # 基础分流层
     cat > "/etc/systemd/system/${SB_SERVICE}" <<EOF
 [Unit]
-Description=NMU Singbox
+Description=NMU Singbox Base
+After=network.target
+
 [Service]
 ExecStart=${BIN_DIR}/singbox run -c ${ETC_DIR}/singbox.json
 User=${SERVICE_USER}
 Restart=always
+RestartSec=3
+
 [Install]
 WantedBy=multi-user.target
 EOF
 
+    # 核心转换层
     cat > "/etc/systemd/system/${XT_SERVICE}" <<EOF
 [Unit]
-Description=NMU xtunnel
+Description=NMU xtunnel Core
 After=${SB_SERVICE}
+Requires=${SB_SERVICE}
+PartOf=${SB_SERVICE}
+
 [Service]
 EnvironmentFile=${ETC_DIR}/env
 ExecStart=${BIN_DIR}/xtunnel -l ws://127.0.0.1:\${WS_PORT} -token \${TOKEN} -f socks5://127.0.0.1:\${SB_PORT}
 User=${SERVICE_USER}
 Restart=always
+RestartSec=3
+
 [Install]
 WantedBy=multi-user.target
 EOF
 
+    # 外部出口层
     cat > "/etc/systemd/system/${CF_SERVICE}" <<EOF
 [Unit]
-Description=NMU Cloudflared
+Description=NMU Cloudflared Exit
 After=${XT_SERVICE}
+Requires=${XT_SERVICE}
+PartOf=${XT_SERVICE}
+
 [Service]
 EnvironmentFile=${ETC_DIR}/env
 ExecStart=/usr/bin/bash -c 'if [ -n "\$CF_TOKEN" ]; then exec ${BIN_DIR}/cloudflared tunnel run --token \$CF_TOKEN; else exec ${BIN_DIR}/cloudflared tunnel --url http://127.0.0.1:\$WS_PORT --metrics 127.0.0.1:\$METRICS_PORT; fi'
 User=${SERVICE_USER}
 Restart=always
+RestartSec=5
+
 [Install]
 WantedBy=multi-user.target
 EOF
+
     systemctl daemon-reload
 }
 
+# --- 5. 启动与诊断 ---
 start_all() {
-    systemctl enable --now "$SB_SERVICE" "$XT_SERVICE" "$CF_SERVICE"
-    say "服务已启动，正在等待隧道建立..."
-    sleep 10
-    if systemctl is-active --quiet "$CF_SERVICE"; then
-        source "${ETC_DIR}/env"
-        domain=$(curl -s http://127.0.0.1:${METRICS_PORT}/metrics | grep 'userHostname=' | sed -E 's/.*userHostname="https?:\/\/([^"]+)".*/\1/' | head -n1 || true)
-        [ -n "$domain" ] && say "临时域名: https://$domain" || say "隧道已建立，请在 CF 面板查看。"
+    say "正在激活服务链路..."
+    # 依次启用
+    systemctl enable "$SB_SERVICE" "$XT_SERVICE" "$CF_SERVICE" >/dev/null 2>&1
+    # 联动重启
+    systemctl restart "$SB_SERVICE"
+    
+    say "等待隧道热启动..."
+    sleep 6
+    
+    if ! systemctl is-active --quiet "$CF_SERVICE"; then
+        say "\033[0;31m启动链路异常，开始回溯日志...\033[0m"
+        journalctl -u "$CF_SERVICE" --no-pager -n 15
+        err "链路建立失败。"
     fi
+
+    say "链路已全面就绪。"
+    source "${ETC_DIR}/env"
+    domain=$(curl -s http://127.0.0.1:${METRICS_PORT}/metrics | grep 'userHostname=' | sed -E 's/.*userHostname="https?:\/\/([^"]+)".*/\1/' | head -n1 || true)
+    [ -n "$domain" ] && say "连接地址: https://$domain"
 }
 
+# --- 6. 执行入口 ---
 case "${1:-help}" in
     install)
         require_root
         install_deps
-        setup_warp
         create_env
         write_configs
         write_units
@@ -163,16 +212,20 @@ case "${1:-help}" in
         ;;
     stop)
         systemctl stop "$CF_SERVICE" "$XT_SERVICE" "$SB_SERVICE"
-        say "服务已停止。"
+        say "链路已断开。"
+        ;;
+    logs)
+        journalctl -u "$CF_SERVICE" -u "$XT_SERVICE" -f
         ;;
     uninstall)
-        systemctl disable --now "$CF_SERVICE" "$XT_SERVICE" "$SB_SERVICE" || true
+        systemctl disable --now "$CF_SERVICE" "$XT_SERVICE" "$SB_SERVICE" >/dev/null 2>&1 || true
         rm -f /etc/systemd/system/nmu-*.service
-        rm -rf "$ETC_DIR" "$LIB_DIR"
-        userdel -r "$SERVICE_USER" || true
-        say "已完全卸载。"
+        systemctl daemon-reload
+        rm -rf "$ETC_DIR" "$LIB_DIR" "$LOG_DIR"
+        userdel -r "$SERVICE_USER" 2>/dev/null || true
+        say "清理完毕。"
         ;;
     *)
-        echo "用法: $0 {install|stop|uninstall}"
+        echo "用法: $0 {install|stop|logs|uninstall}"
         ;;
 esac
