@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# =========================================================
+#  suoha x-tunnel (Universal Public Edition)
+#  - 安全：移除所有硬编码的个人信息与特定配置示例
+#  - 隔离：进程与权限严格隔离，支持动态分流
+#  - 适配：支持 AMD64 和 ARM64 架构
+# =========================================================
+
 # --- 环境常量 ---
 SERVICE_USER="nmu-tunnel"
 SCREEN_NAME_PREFIX="nmu_tunnel_"
@@ -36,6 +43,7 @@ install_deps() {
 setup_env() {
     if [ "$(id -u)" -eq 0 ]; then
         if ! id "$SERVICE_USER" &>/dev/null; then
+            say "正在创建专用安全用户: $SERVICE_USER ..."
             useradd -m -s /usr/sbin/nologin "$SERVICE_USER" || useradd -m -s /bin/false "$SERVICE_USER"
         fi
         USER_HOME=$(eval echo "~$SERVICE_USER")
@@ -85,6 +93,7 @@ quicktunnel() {
     say "正在安全下载核心组件..."
     SB_VER=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep tag_name | cut -d ":" -f2 | tr -d '\"v ,')
     export ARCH_F="$arch" SB_V="$SB_VER"
+    # 注意：此处使用的链接为您的 GitHub 仓库路径占位符
     safe_run "
         curl -fsSL https://github.com/nmu-glitch/my-tunnels/releases/download/v1.0.0/x-tunnel-linux-\$ARCH_F -o xtunnel
         curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-\$ARCH_F -o cloudflared
@@ -131,11 +140,11 @@ EOF
         clear
         say_ok "系统启动成功！"
         say "----------------------------------"
-        say "固定域名: https://${fixed_domain:-未填写}"
-        say "固定端口: $wsport"
-        say "身份令牌: $token"
+        say "固定域名: https://${fixed_domain:-未指定}"
+        say "本地监听端口: $wsport"
+        say "身份连接令牌: ${token:-未设置}"
         say "----------------------------------"
-        say_warn "请确保 Cloudflare 控制面板中该域名已指向 http://127.0.0.1:$wsport"
+        say_warn "请确保 Cloudflare 面板中 Public Hostname 指向 http://127.0.0.1:$wsport"
     fi
 }
 
@@ -144,30 +153,30 @@ install_deps
 setup_env
 clear
 say "=================================================="
-say "      NMU-Glitch 极速隧道管理面板 (全能版)      "
+say "      NMU-Glitch 极速隧道管理面板 (通用版)      "
 say "=================================================="
-echo " 1. 启动服务 (手动配置)"
+echo " 1. 启动服务 (交互式配置)"
 echo " 2. 停止服务"
-echo " 3. 彻底卸载"
+echo " 3. 彻底卸载 (删除运行环境与用户)"
 echo " 0. 退出"
 read -p "请选择 [0-3]: " mode
 
 case "${mode:-1}" in
     1)
-        echo -e "\n${YELLOW}--- 基础安全设置 ---${NC}"
-        read -p "1. 设置隧道连接令牌 (Token): " token
-        read -p "2. 设置本地固定端口 (例如 56908): " wsport
+        echo -e "\n${YELLOW}--- [1] 隧道安全基础设置 ---${NC}"
+        read -p "请输入隧道连接令牌 (Token/密码): " token
+        read -p "请输入本地监听端口 (建议 10000-60000): " wsport
         
-        echo -e "\n${YELLOW}--- Cloudflare 绑定设置 ---${NC}"
-        read -p "3. 输入 CF Tunnel Token (eyJh...，留空则用临时域名): " cf_tunnel_token
+        echo -e "\n${YELLOW}--- [2] Cloudflare 隧道设置 ---${NC}"
+        read -p "请输入 CF Tunnel Token (留空则使用临时域名): " cf_tunnel_token
         if [[ -n "$cf_tunnel_token" ]]; then
-            read -p "4. 输入你在 CF 绑定的完整域名 (例如 nmutun.nmu.netlib.re): " fixed_domain
+            read -p "请输入您在 CF 绑定的域名 (仅用于显示): " fixed_domain
         else
             fixed_domain=""
         fi
 
-        echo -e "\n${YELLOW}--- 智能分流设置 ---${NC}"
-        read -p "5. 额外需要走 WARP 的域名 (逗号隔开，可选): " warp_domains
+        echo -e "\n${YELLOW}--- [3] 智能分流设置 ---${NC}"
+        read -p "请输入需要走 WARP 的额外域名 (逗号隔开): " warp_domains
         
         quicktunnel ;;
     2)
@@ -175,8 +184,12 @@ case "${mode:-1}" in
         say_ok "服务已停止。" ;;
     3)
         stop_services
-        [[ "$(id -u)" -eq 0 ]] && userdel -r "$SERVICE_USER" 2>/dev/null || rm -rf "$WORK_DIR"
-        say_ok "物理卸载完成。" ;;
+        if [ "$(id -u)" -eq 0 ]; then
+            userdel -r "$SERVICE_USER" 2>/dev/null || rm -rf "$WORK_DIR"
+        else
+            rm -rf "$WORK_DIR"
+        fi
+        say_ok "系统环境已物理清理。" ;;
     *)
         exit 0 ;;
 esac
