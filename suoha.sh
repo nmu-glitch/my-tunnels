@@ -21,7 +21,7 @@ say_ok() { printf "${GREEN}[OK]${NC} %s\n" "$*"; }
 say_warn() { printf "${YELLOW}[WARN]${NC} %s\n" "$*"; }
 say_err() { printf "${RED}[FAIL]${NC} %s\n" "$*"; }
 
-# --- 1. 系统依赖初始化 ---
+# --- 初始化 (略，保持之前的 install_deps 和 setup_env) ---
 install_deps() {
     if [ "$(id -u)" -ne 0 ]; then return; fi
     if command -v apt-get &>/dev/null; then
@@ -31,7 +31,6 @@ install_deps() {
     fi
 }
 
-# --- 2. 运行用户环境隔离 ---
 setup_env() {
     if [ "$(id -u)" -eq 0 ]; then
         if ! id "$SERVICE_USER" &>/dev/null; then
@@ -49,7 +48,6 @@ setup_env() {
     chmod 700 "$WORK_DIR" "$SCREEN_DIR"
 }
 
-# --- 3. 跨用户安全执行 ---
 safe_run() {
     local cmd="$1"
     export EX_WS_PORT="${wsport:-}"
@@ -57,61 +55,13 @@ safe_run() {
     export EX_CF_TOKEN="${cf_tunnel_token:-}"
     export EX_WARP_DOMAINS="${warp_domains:-}"
     export SCREENDIR="$SCREEN_DIR" 
-
     if [ "$(id -u)" -eq 0 ]; then
-        sudo -u "$SERVICE_USER" --preserve-env=EX_WS_PORT,EX_TOKEN,EX_CF_TOKEN,EX_WARP_DOMAINS,SCREENDIR,TERM \
-            bash -c "cd $WORK_DIR && $cmd"
+        sudo -u "$SERVICE_USER" --preserve-env=EX_WS_PORT,EX_TOKEN,EX_CF_TOKEN,EX_WARP_DOMAINS,SCREENDIR,TERM bash -c "cd $WORK_DIR && $cmd"
     else
         bash -c "cd $WORK_DIR && $cmd"
     fi
 }
 
-# --- 4. 生成 Sing-box 配置 (核心逻辑) ---
-write_sb_json() {
-    safe_run "
-        BASE_DOMAINS='\"netflix.com\",\"netflix.net\",\"nflximg.net\",\"nflxvideo.net\",\"nflxso.net\",\"chatgpt.com\",\"openai.com\",\"oaistatic.com\",\"oaiusercontent.com\"'
-        if [[ -n \"\$EX_WARP_DOMAINS\" ]]; then
-            for d in \$(echo \$EX_WARP_DOMAINS | tr ',' ' '); do
-                BASE_DOMAINS=\"\$BASE_DOMAINS,\\\"\$d\\\"\"
-            done
-        fi
-        cat > sb.json <<EOF
-{
-  \"inbounds\": [{\"type\": \"socks\", \"listen\": \"127.0.0.1\", \"listen_port\": 50000}],
-  \"outbounds\": [
-    {\"type\": \"direct\", \"tag\": \"direct\"},
-    {\"type\": \"socks\", \"tag\": \"warp\", \"server\": \"127.0.0.1\", \"server_port\": 40000}
-  ],
-  \"route\": { 
-    \"rules\": [{\"domain\": [ \$BASE_DOMAINS ], \"outbound\": \"warp\"}], 
-    \"final\": \"direct\" 
-  }
-}
-EOF
-    "
-}
-
-# --- 5. 动态更新域名 (不重启隧道) ---
-update_warp_domains() {
-    if ! screen -ls | grep -q "$S_SINGBOX"; then
-        say_err "服务未运行，请先执行选项 1 启动。"
-        return
-    fi
-    read -p "请输入要增加走 WARP 的域名 (如: youtube.com,google.com): " warp_domains
-    say "正在更新规则..."
-    write_sb_json
-    # 仅重启 Sing-box 会话
-    if [ "$(id -u)" -eq 0 ]; then
-        sudo -u "$SERVICE_USER" env SCREENDIR="$SCREEN_DIR" screen -S "$S_SINGBOX" -X quit || true
-    else
-        SCREENDIR="$SCREEN_DIR" screen -S "$S_SINGBOX" -X quit || true
-    fi
-    sleep 1
-    safe_run "screen -dmUS $S_SINGBOX ./singbox run -c sb.json"
-    say_ok "规则已更新！Argo 域名未受影响，分流已生效。"
-}
-
-# --- 6. 停止与启动服务 (略，见下文逻辑) ---
 stop_services() {
     local sessions=("$S_X_TUNNEL" "$S_ARGO" "$S_SINGBOX" "$S_CFBIND")
     for s in "${sessions[@]}"; do
@@ -123,6 +73,7 @@ stop_services() {
     done
 }
 
+# --- 核心逻辑 ---
 quicktunnel() {
     local arch; [[ "$(uname -m)" == "x86_64" ]] && arch="amd64" || arch="arm64"
     stop_services
@@ -136,44 +87,65 @@ quicktunnel() {
         tar -zxf sb.tar.gz --strip-components=1 && mv sing-box singbox && rm -f sb.tar.gz
         chmod 700 xtunnel cloudflared singbox
     "
+    
     wsport="${wsport:-$((RANDOM % 50000 + 10000))}"
     metricsport=$((RANDOM % 50000 + 10000))
-    write_sb_json
+
+    # 写配置
+    safe_run "
+        BASE_DOMAINS='\"netflix.com\",\"netflix.net\",\"chatgpt.com\",\"openai.com\"'
+        if [[ -n \"\$EX_WARP_DOMAINS\" ]]; then
+            for d in \$(echo \$EX_WARP_DOMAINS | tr ',' ' '); do
+                BASE_DOMAINS=\"\$BASE_DOMAINS,\\\"\$d\\\"\"
+            done
+        fi
+        cat > sb.json <<EOF
+{
+  \"inbounds\": [{\"type\": \"socks\", \"listen\": \"127.0.0.1\", \"listen_port\": 50000}],
+  \"outbounds\": [{\"type\": \"direct\", \"tag\": \"direct\"}, {\"type\": \"socks\", \"tag\": \"warp\", \"server\": \"127.0.0.1\", \"server_port\": 40000}],
+  \"route\": { \"rules\": [{\"domain\": [ \$BASE_DOMAINS ], \"outbound\": \"warp\"}], \"final\": \"direct\" }
+}
+EOF
+    "
+
     say "启动中..."
     safe_run "
         screen -dmUS $S_SINGBOX ./singbox run -c sb.json
         screen -dmUS $S_X_TUNNEL ./xtunnel -l 127.0.0.1:\$EX_WS_PORT -token \"\$EX_TOKEN\" -f socks5://127.0.0.1:50000
-        screen -dmUS $S_ARGO ./cloudflared tunnel --protocol http2 --url 127.0.0.1:\$EX_WS_PORT --metrics 127.0.0.1:$metricsport
-        [[ -n \"\$EX_CF_TOKEN\" ]] && screen -dmUS $S_CFBIND ./cloudflared tunnel run --token \"\$EX_CF_TOKEN\"
     "
-    sleep 10
-    TRY_DOMAIN=$(safe_run "curl -s http://127.0.0.1:$metricsport/metrics" | grep 'userHostname=' | sed -E 's/.*userHostname="https?:\/\/([^"]+)".*/\1/' | head -n1 || true)
-    say_ok "启动成功！域名: https://${TRY_DOMAIN:-获取中}"
+
+    if [[ -z "$cf_tunnel_token" ]]; then
+        say "未检测到 Token，启动临时隧道模式..."
+        safe_run "screen -dmUS $S_ARGO ./cloudflared tunnel --protocol http2 --url 127.0.0.1:\$EX_WS_PORT --metrics 127.0.0.1:$metricsport"
+        sleep 12
+        TRY_DOMAIN=$(safe_run "curl -s http://127.0.0.1:$metricsport/metrics" | grep 'userHostname=' | sed -E 's/.*userHostname="https?:\/\/([^"]+)".*/\1/' | head -n1 || true)
+        say_ok "启动成功！临时域名: https://${TRY_DOMAIN:-获取失败}"
+    else
+        say_ok "检测到 Token，启动固定域名模式..."
+        safe_run "screen -dmUS $S_CFBIND ./cloudflared tunnel run --token \"\$EX_CF_TOKEN\""
+        say_ok "启动指令已下发！请在 Cloudflare Dashboard 查看域名状态。"
+        say "固定端口已锁定为: $wsport"
+    fi
 }
 
-# --- 菜单界面 ---
+# --- 菜单 (同前) ---
 install_deps
 setup_env
 clear
 say "=================================================="
-say "      NMU-Glitch 全能整合安全面板 (动态版)       "
+say "      NMU-Glitch 全能整合安全面板 (修正版)       "
 say "=================================================="
-echo " 1. 启动服务 (手动配置 + 初始分流)"
+echo " 1. 启动服务"
 echo " 2. 停止服务"
-echo " 3. 物理卸载"
-echo " 4. 【动态更新】添加走 WARP 的域名 (不断域名)"
 echo " 0. 退出"
-read -p "选择操作: " mode
-
+read -p "选择: " mode
 case "${mode:-1}" in
     1)
         read -p "Token: " token
-        read -p "固定端口? (直接回车随机, 否则输入端口): " wsport
-        read -p "CF Tunnel Token (可选): " cf_tunnel_token
-        read -p "分流域名 (逗号隔开): " warp_domains
+        read -p "固定端口 (必填): " wsport
+        read -p "CF Tunnel Token (固定域名必填): " cf_tunnel_token
+        read -p "分流域名 (Netflix/ChatGPT已内置, 额外请填): " warp_domains
         quicktunnel ;;
     2) stop_services; say_ok "已停止" ;;
-    3) stop_services; [[ "$(id -u)" -eq 0 ]] && userdel -r "$SERVICE_USER" || rm -rf "$WORK_DIR"; say_ok "已卸载" ;;
-    4) update_warp_domains ;;
     *) exit 0 ;;
 esac
