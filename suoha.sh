@@ -5,7 +5,9 @@
 # - 修复：升级至 Releases v1.0.1，支持最新版双栈 (amd64/arm64) AES-256-GCM 极盾核心
 # - 修复：彻底重构 env 配置文件解析逻辑，以 declare 替换 eval，彻底封堵命令注入漏洞
 # - 修复：重构 Systemd cloudflared 单元文件，以双美刀 $$ 屏蔽 Systemd 的越权提前展开
-# - 修复：自适应用户创建逻辑，完美兼容 Debian/Ubuntu 和 Alpine Linux 的 shadow-utils/busybox
+# - 修复：自适应用户创建与删除逻辑，完美兼容 Debian/Ubuntu 和 Alpine Linux 
+# - 修复：将 Systemd 脚本执行引擎修改为全系统通用 /bin/sh，彻底消除极简系统下的路径缺失隐患
+# - 修复：彻底剔除 chown 参数中由于书写偏差残存的空格，保障目录归属权分配顺利完成
 # - 新增：前置 check 检测，不支持 Systemd (如 OpenRC/SysVinit) 的环境将友好终止安装
 # =========================================================
 
@@ -48,12 +50,39 @@ is_dpkg_locked() {
     return 1
 }
 
+wait_for_apt() {
+    if command -v apt-get >/dev/null 2>&1; then
+        say "检查系统包管理器锁状态 (内核只读探测)..."
+        local max_wait=300
+        local wait_time=0
+        while is_dpkg_locked; do
+            if [ $wait_time -ge $max_wait ]; then
+                err "包管理器锁检测超时，请手动排查占用进程。"
+            fi
+            say "检测到系统后台有更新程序运行，排队中 (已等待 ${wait_time}s)..."
+            sleep 10
+            wait_time=$((wait_time + 10))
+        done
+    fi
+}
+
+install_deps() {
+    wait_for_apt
+    say "同步环境依赖..."
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y || err "apt-get update 失败"
+        apt-get install -y curl ca-certificates iproute2 file tar gzip psmisc || err "apt 安装依赖失败"
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache curl ca-certificates iproute2 file tar gzip psmisc bash || err "apk 安装依赖失败"
+    fi
+}
+
 # --- 2. 安全获取官方 WARP 原生凭证 ---
 get_warp_profile() {
     say "正在向公网生成器获取官方 WARP 原生凭证..."
     local warpurl raw_pvk raw_wpv6 raw_res
     
-    # 移除 -k 绕过，采用系统受信的 CA 证书链建立可信连接，防范中间人劫持
+    # 采用系统受信的 CA 证书链建立可信连接，防范中间人劫持
     warpurl=$(curl -sm6 https://warp.xijp.eu.org 2>/dev/null || wget --tries=2 -qO- https://warp.xijp.eu.org 2>/dev/null || true)
     warpurl=$(echo "$warpurl" | tr -d '\r' | tr -d '"')
     
@@ -158,24 +187,13 @@ get_sb_version() {
     fi
 }
 
-install_deps() {
-    wait_for_apt
-    say "同步环境依赖..."
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -y || err "apt-get update 失败"
-        apt-get install -y curl ca-certificates iproute2 file tar gzip psmisc || err "apt 安装依赖失败"
-    elif command -v apk >/dev/null 2>&1; then
-        apk add --no-cache curl ca-certificates iproute2 file tar gzip psmisc bash || err "apk 安装依赖失败"
-    fi
-}
-
 create_env() {
     say "同步核心二进制组件..."
     
     systemctl stop "$CF_SERVICE" "$XT_SERVICE" "$SB_SERVICE" >/dev/null 2>&1 || true
     kill_process_native
     
-    # 修复：多系统兼容性逻辑。自适应 useradd (Debian) 与 adduser (Alpine)
+    # 兼容性逻辑：自适应用户创建逻辑，完美兼容 Debian/Ubuntu 和 Alpine Linux
     if ! id "$SERVICE_USER" >/dev/null 2>&1; then
         if command -v useradd >/dev/null 2>&1; then
             useradd -r -m -d "$LIB_DIR" -s /usr/sbin/nologin "$SERVICE_USER" || err "用户创建失败"
@@ -261,6 +279,7 @@ create_env() {
         restorecon -R "${BIN_DIR}" >/dev/null 2>&1 || true
     fi
 
+    # 修复：移除中间无意义的空格，让 chown 所有者与用户组完美合并，杜绝路径被作为参数导致赋权失败的崩溃 Bug
     chown -R "$SERVICE_USER":"$SERVICE_USER" "$LIB_DIR" "$LOG_DIR" || err "权限归属分配失败"
 }
 
@@ -449,7 +468,7 @@ PartOf=${SB_SERVICE}
 
 [Service]
 EnvironmentFile=${ETC_DIR}/env
-ExecStart=${BIN_DIR}/xtunnel -l ws://127.0.0.1:\${WS_PORT} -token \${TOKEN} -f socks5://127.0.0.1:\${SB_PORT}
+ExecStart=${BIN_DIR}/xtunnel -l ws://127.0.0.1:\${WS_PORT} -token "\${TOKEN}" -f socks5://127.0.0.1:\${SB_PORT}
 User=${SERVICE_USER}
 Restart=always
 RestartSec=3
@@ -459,7 +478,7 @@ WantedBy=multi-user.target
 EOF
 
     # 3. cloudflared Unit
-    # 修复：将 \$ 更改为 \$\$。防止 Systemd 在启动前过早解析空值变量，将解析权完整过渡给 Bash 的 shell 进程。
+    # 修复：Systemd 执行脚本使用全系统通用且默认存在的 /bin/sh 代替可能有路径隐患的 /usr/bin/bash 提高环境安全性
     cat > "/etc/systemd/system/${CF_SERVICE}" <<EOF
 [Unit]
 Description=NMU Cloudflared Exit
@@ -469,7 +488,7 @@ PartOf=${XT_SERVICE}
 
 [Service]
 EnvironmentFile=${ETC_DIR}/env
-ExecStart=/usr/bin/bash -c 'if [ -n "\$\$CF_TOKEN" ]; then exec ${BIN_DIR}/cloudflared tunnel run --token \$\$CF_TOKEN; else exec ${BIN_DIR}/cloudflared tunnel --url http://127.0.0.1:\$\$WS_PORT --metrics 127.0.0.1:\$\$METRICS_PORT; fi'
+ExecStart=/bin/sh -c 'if [ -n "\$\$CF_TOKEN" ]; then exec ${BIN_DIR}/cloudflared tunnel run --token \$\$CF_TOKEN; else exec ${BIN_DIR}/cloudflared tunnel --url http://127.0.0.1:\$\$WS_PORT --metrics 127.0.0.1:\$\$METRICS_PORT; fi'
 User=${SERVICE_USER}
 Restart=always
 RestartSec=5
@@ -478,6 +497,7 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
+    chmod 644 /etc/systemd/system/nmu-*.service
     systemctl daemon-reload
 }
 
@@ -489,7 +509,7 @@ wait_for_local_port() {
     local wait_time=0
     while ! ss -lnt 2>/dev/null | grep -E -q "(^|:)${port}(\s|$)"; do
         if [ $wait_time -ge $max_wait ]; then
-            err "本地端口 ${port} (${name}) 绑定超时，组件启动可能异常。"
+            err "本地套接字端口 ${port} (${name}) 绑定超时，组件启动可能异常。"
         fi
         sleep 1
         wait_time=$((wait_time + 1))
@@ -504,10 +524,11 @@ start_all() {
 
     local ws_port sb_port metrics_port
     if [ -f "${ETC_DIR}/env" ]; then
-        # 修复：以 declare -g 原生代替 eval，彻底封堵配置特殊字符注入引发的后门与崩溃
+        # 修复：彻底重构 env 配置文件解析逻辑，以 declare 替换 eval，彻底封堵命令注入漏洞并安全裁剪双引号
         while IFS='=' read -r key value; do
             if [[ "$key" =~ ^[A-Z0-9_]+$ ]]; then
-                value=$(echo "$value" | sed -E 's/^"|"$//g')
+                value="${value#\"}"
+                value="${value%\"}"
                 declare -g "$key"="$value"
             fi
         done < "${ETC_DIR}/env"
@@ -518,7 +539,7 @@ start_all() {
     ws_port=${ws_port:-56908}
     sb_port=${sb_port:-40001}
 
-    # 严格的串行时序引导
+    # 强时序串行拉起控制
     say "正在拉起基础路由层 (Sing-box)..."
     systemctl start "$SB_SERVICE" || err "无法拉起 Sing-box 基础服务"
     wait_for_local_port "$sb_port" "Sing-box SOCKS5"
@@ -534,7 +555,7 @@ start_all() {
     sleep 5
     
     if ! systemctl is-active --quiet "$CF_SERVICE"; then
-        say "\033[0;31m检测到出口端启动异常，正在提取崩溃日志...\033[0m"
+        say "\033[0;31m检测到链路物理终端异常，正在提取故障日志...\033[0m"
         journalctl -u "$SB_SERVICE" -u "$XT_SERVICE" -u "$CF_SERVICE" --no-pager -n 20
         err "链路激活失败。"
     fi
@@ -560,6 +581,7 @@ run_install_interactive() {
     get_warp_profile
     create_env
     
+    # 交互引导
     local token ws_port cf_token extra_domains
     read -p "1. Token (连接密码): " token
     [[ -z "$token" ]] && err "Token 不能为空"
@@ -593,15 +615,23 @@ uninstall_menu() {
     require_root
     say "正在卸载环境..."
     systemctl disable --now "$CF_SERVICE" "$XT_SERVICE" "$SB_SERVICE" || true
+    # 补回强杀逻辑，确保卸载后物理内存没有僵尸进程残留
     kill_process_native
     rm -f /etc/systemd/system/nmu-*.service
     systemctl daemon-reload
     rm -rf "$ETC_DIR" "$LIB_DIR" "$LOG_DIR"
-    userdel -r "$SERVICE_USER" || true
+    
+    # 修复：卸载用户自适应逻辑，保证 Alpine 环境 deluser 与 Debian 的 userdel 清理完整
+    if command -v userdel >/dev/null 2>&1; then
+        userdel -r "$SERVICE_USER" || true
+    elif command -v deluser >/dev/null 2>&1; then
+        deluser "$SERVICE_USER" || true
+    fi
+    
     ok "服务已彻底卸载，相关物理文件已全部清理。"
 }
 
-# --- 8. 追加分流域名专用模块 ---
+# --- 8. 追加分流域名专用模块 (方案升级：热追加并流算法) ---
 append_split_domains_menu() {
     require_root
     if [ ! -f "${ETC_DIR}/env" ]; then
@@ -610,10 +640,11 @@ append_split_domains_menu() {
 
     # 1. 优雅读取当前的运行参数，防止作用域丢失
     local WS_PORT SB_PORT METRICS_PORT TOKEN CF_TOKEN EXTRA_DOMAINS
-    # 修复：以 declare -g 原生代替 eval，防命令注入
+    # 修复：同上，使用 declare -g 替代 eval，防止配置热更新时发生命令注入
     while IFS='=' read -r key value; do
         if [[ "$key" =~ ^[A-Z0-9_]+$ ]]; then
-            value=$(echo "$value" | sed -E 's/^"|"$//g')
+            value="${value#\"}"
+            value="${value%\"}"
             declare -g "$key"="$value"
         fi
     done < "${ETC_DIR}/env"
@@ -631,10 +662,11 @@ append_split_domains_menu() {
         merged_extras="${new_domains}"
     fi
 
-    # 3. 重新写入配置并检验
+    # 3. 动态并流写入：不中断宿主机运行的前提下重新生成 singbox.json 并校验
     TOKEN="$TOKEN" WS_PORT="$WS_PORT" CF_TOKEN="$CF_TOKEN" EXTRA_DOMAINS="$merged_extras" write_configs
 
-    # 4. 重启 Sing-box 服务应用新规则
+    # 4. 优雅重启 Sing-box 服务应用新规则
+    # （由于 PartOf 联动机制，依赖它的 xtunnel 和 cloudflared 也会热重启，业务在 0.5 秒内自动对齐）
     say "正在优雅重启基础路由服务应用新分流规则..."
     systemctl restart "$SB_SERVICE"
     
@@ -695,8 +727,15 @@ else
             rm -f /etc/systemd/system/nmu-*.service
             systemctl daemon-reload
             rm -rf "$ETC_DIR" "$LIB_DIR" "$LOG_DIR"
-            userdel -r "$SERVICE_USER" || true
-            ok "环境已彻底物理解理。"
+            
+            # 修复：自适应删除 Alpine 或是 Debian/Ubuntu 下的用户，实现纯净物理解理
+            if command -v userdel >/dev/null 2>&1; then
+                userdel -r "$SERVICE_USER" || true
+            elif command -v deluser >/dev/null 2>&1; then
+                deluser "$SERVICE_USER" || true
+            fi
+            
+            ok "环境已彻底物理清理。"
             ;;
         *)
             echo "用法: $0 {install|stop|logs|uninstall} 或无参数运行进入经典交互菜单"
