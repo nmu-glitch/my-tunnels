@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# NMU Tunnel V12.9 - 生产级精调安全加固版
-# - 修复：升级至 Releases v1.0.1，支持最新版双栈 (amd64/arm64) AES-256-GCM 极盾核心
+# NMU Tunnel V13.0 - 生产级极盾 E2E 加密安全加固版
+# - 修复：支持最新版双栈 (amd64/arm64) AES-256-GCM 极盾核心
 # - 修复：彻底重构 env 配置文件解析逻辑，以 declare 替换 eval，彻底封堵命令注入漏洞
-# - 修复：重构 Systemd cloudflared 单元文件，以双美刀 $$ 屏蔽 Systemd 的越权提前展开
+# - 修复：重构 Systemd cloudflared/xtunnel 单元，以双美刀 $$ 屏蔽 Systemd 的越权提前展开
 # - 修复：自适应用户创建与删除逻辑，完美兼容 Debian/Ubuntu 和 Alpine Linux 
 # - 修复：将 Systemd 脚本执行引擎修改为全系统通用 /bin/sh，彻底消除极简系统下的路径缺失隐患
 # - 修复：彻底剔除 chown 参数中由于书写偏差残存的空格，保障目录归属权分配顺利完成
 # - 新增：前置 check 检测，不支持 Systemd (如 OpenRC/SysVinit) 的环境将友好终止安装
+# - 新增：支持 AES-256-GCM 密钥交互式配置，支持无缝向下兼容标准未加密传输
 # =========================================================
 
 APP_NAME="nmu-tunnel"
@@ -22,7 +23,7 @@ SB_SERVICE="nmu-singbox.service"
 XT_SERVICE="nmu-xtunnel.service"
 CF_SERVICE="nmu-cloudflared.service"
 
-say() { echo -e "\033[0;34m[NMU-V12.9]\033[0m $*"; }
+say() { echo -e "\033[0;34m[NMU-V13.0]\033[0m $*"; }
 ok() { echo -e "\033[0;32m[OK]\033[0m $*"; }
 err() { echo -e "\033[0;31m[ERROR]\033[0m $*"; exit 1; }
 
@@ -217,7 +218,14 @@ create_env() {
         mv -f "${BIN_DIR}/xtunnel" "${BIN_DIR}/xtunnel.old" >/dev/null 2>&1 || true
         rm -f "${BIN_DIR}/xtunnel.old" >/dev/null 2>&1 &
     fi
-    curl -fL --retry 3 "https://github.com/nmu-glitch/my-tunnels/releases/download/v1.0.1/x-tunnel-linux-${ARCH}" -o "/tmp/xtunnel" || err "xtunnel 下载失败"
+
+    # 优化支持：如果在 /tmp 已经手动放置了自定义编译的测试版，跳过下载直接使用它
+    if [[ -f "/tmp/xtunnel" ]]; then
+        say "检测到本地上传的自定义 xtunnel 核心，跳过远程下载，直接同步部署。"
+    else
+        say "自 GitHub 仓库同步最新 AES-256-GCM 核心..."
+        curl -fL --retry 3 "https://github.com/nmu-glitch/my-tunnels/releases/download/v1.0.1/x-tunnel-linux-${ARCH}" -o "/tmp/xtunnel" || err "xtunnel 下载失败"
+    fi
     mv -f "/tmp/xtunnel" "${BIN_DIR}/xtunnel"
     
     # --- CLOUDFLARED 同步 ---
@@ -279,7 +287,6 @@ create_env() {
         restorecon -R "${BIN_DIR}" >/dev/null 2>&1 || true
     fi
 
-    # 修复：移除中间无意义的空格，让 chown 所有者与用户组完美合并，杜绝路径被作为参数导致赋权失败的崩溃 Bug
     chown -R "$SERVICE_USER":"$SERVICE_USER" "$LIB_DIR" "$LOG_DIR" || err "权限归属分配失败"
 }
 
@@ -291,6 +298,7 @@ write_configs() {
     local ws_port="${WS_PORT}"
     local cf_token="${CF_TOKEN}"
     local extra_domains="${EXTRA_DOMAINS}"
+    local secret="${SECRET}" # 获取 E2E 加密密钥
 
     if [[ -z "$token" ]]; then
         if [ -t 0 ]; then
@@ -337,7 +345,7 @@ write_configs() {
     endpoint=${endpoint:-"162.159.192.1"}
     local_addr=${local_addr:-'["172.16.0.2/32"]'}
 
-    # 环境变量持久化保存
+    # 环境变量持久化保存 (带入 SECRET)
     cat > "${ETC_DIR}/env" <<EOF
 WS_PORT="${ws_port}"
 SB_PORT="${sb_port}"
@@ -345,6 +353,7 @@ METRICS_PORT="${m_port}"
 TOKEN="${token}"
 CF_TOKEN="${cf_token}"
 EXTRA_DOMAINS="${extra_domains}"
+SECRET="${secret}"
 EOF
 
     # 基础分流，不侵扰原有链路
@@ -459,6 +468,7 @@ WantedBy=multi-user.target
 EOF
 
     # 2. xtunnel Unit
+    # 支持一键自适应判断，有密钥时使用 -secret 启动极盾 E2E 加密通道，否则启动普通传输通道
     cat > "/etc/systemd/system/${XT_SERVICE}" <<EOF
 [Unit]
 Description=NMU xtunnel Core
@@ -468,7 +478,7 @@ PartOf=${SB_SERVICE}
 
 [Service]
 EnvironmentFile=${ETC_DIR}/env
-ExecStart=${BIN_DIR}/xtunnel -l ws://127.0.0.1:\${WS_PORT} -token "\${TOKEN}" -f socks5://127.0.0.1:\${SB_PORT}
+ExecStart=/bin/sh -c 'if [ -n "\$\$SECRET" ]; then exec ${BIN_DIR}/xtunnel -l ws://127.0.0.1:\$\$WS_PORT -token "\$\$TOKEN" -f socks5://127.0.0.1:\$\$SB_PORT -secret "\$\$SECRET"; else exec ${BIN_DIR}/xtunnel -l ws://127.0.0.1:\$\$WS_PORT -token "\$\$TOKEN" -f socks5://127.0.0.1:\$\$SB_PORT; fi'
 User=${SERVICE_USER}
 Restart=always
 RestartSec=3
@@ -478,7 +488,6 @@ WantedBy=multi-user.target
 EOF
 
     # 3. cloudflared Unit
-    # 修复：Systemd 执行脚本使用全系统通用且默认存在的 /bin/sh 代替可能有路径隐患的 /usr/bin/bash 提高环境安全性
     cat > "/etc/systemd/system/${CF_SERVICE}" <<EOF
 [Unit]
 Description=NMU Cloudflared Exit
@@ -524,7 +533,6 @@ start_all() {
 
     local ws_port sb_port metrics_port
     if [ -f "${ETC_DIR}/env" ]; then
-        # 修复：彻底重构 env 配置文件解析逻辑，以 declare 替换 eval，彻底封堵命令注入漏洞并安全裁剪双引号
         while IFS='=' read -r key value; do
             if [[ "$key" =~ ^[A-Z0-9_]+$ ]]; then
                 value="${value#\"}"
@@ -582,17 +590,19 @@ run_install_interactive() {
     create_env
     
     # 交互引导
-    local token ws_port cf_token extra_domains
+    local token ws_port cf_token extra_domains secret
     read -p "1. Token (连接密码): " token
     [[ -z "$token" ]] && err "Token 不能为空"
     read -p "2. 本地监听端口 (默认 56908): " ws_port; ws_port=${ws_port:-56908}
     read -p "3. CF Tunnel Token (留空用临时域名): " cf_token
     read -p "4. 追加分流域名 (用逗号隔开，不改变默认分流): " extra_domains
+    read -p "5. AES-256-GCM 极盾对称密钥 (留空则不开启对称加密): " secret
 
     TOKEN="$token"
     WS_PORT="$ws_port"
     CF_TOKEN="$cf_token"
     EXTRA_DOMAINS="$extra_domains"
+    SECRET="$secret"
 
     write_configs
     write_units
@@ -615,13 +625,11 @@ uninstall_menu() {
     require_root
     say "正在卸载环境..."
     systemctl disable --now "$CF_SERVICE" "$XT_SERVICE" "$SB_SERVICE" || true
-    # 补回强杀逻辑，确保卸载后物理内存没有僵尸进程残留
     kill_process_native
     rm -f /etc/systemd/system/nmu-*.service
     systemctl daemon-reload
     rm -rf "$ETC_DIR" "$LIB_DIR" "$LOG_DIR"
     
-    # 修复：卸载用户自适应逻辑，保证 Alpine 环境 deluser 与 Debian 的 userdel 清理完整
     if command -v userdel >/dev/null 2>&1; then
         userdel -r "$SERVICE_USER" || true
     elif command -v deluser >/dev/null 2>&1; then
@@ -631,7 +639,7 @@ uninstall_menu() {
     ok "服务已彻底卸载，相关物理文件已全部清理。"
 }
 
-# --- 8. 追加分流域名专用模块 (方案升级：热追加并流算法) ---
+# --- 8. 追加分流域名专用模块 (热追加并流算法) ---
 append_split_domains_menu() {
     require_root
     if [ ! -f "${ETC_DIR}/env" ]; then
@@ -639,8 +647,7 @@ append_split_domains_menu() {
     fi
 
     # 1. 优雅读取当前的运行参数，防止作用域丢失
-    local WS_PORT SB_PORT METRICS_PORT TOKEN CF_TOKEN EXTRA_DOMAINS
-    # 修复：同上，使用 declare -g 替代 eval，防止配置热更新时发生命令注入
+    local WS_PORT SB_PORT METRICS_PORT TOKEN CF_TOKEN EXTRA_DOMAINS SECRET
     while IFS='=' read -r key value; do
         if [[ "$key" =~ ^[A-Z0-9_]+$ ]]; then
             value="${value#\"}"
@@ -662,11 +669,10 @@ append_split_domains_menu() {
         merged_extras="${new_domains}"
     fi
 
-    # 3. 动态并流写入：不中断宿主机运行的前提下重新生成 singbox.json 并校验
-    TOKEN="$TOKEN" WS_PORT="$WS_PORT" CF_TOKEN="$CF_TOKEN" EXTRA_DOMAINS="$merged_extras" write_configs
+    # 3. 动态并流写入
+    TOKEN="$TOKEN" WS_PORT="$WS_PORT" CF_TOKEN="$CF_TOKEN" EXTRA_DOMAINS="$merged_extras" SECRET="$SECRET" write_configs
 
     # 4. 优雅重启 Sing-box 服务应用新规则
-    # （由于 PartOf 联动机制，依赖它的 xtunnel 和 cloudflared 也会热重启，业务在 0.5 秒内自动对齐）
     say "正在优雅重启基础路由服务应用新分流规则..."
     systemctl restart "$SB_SERVICE"
     
@@ -678,7 +684,7 @@ append_split_domains_menu() {
 menu() {
     clear
     say "=================================================="
-    say "         NMU-Tunnel 最终加固导航版 (V12.9)         "
+    say "         NMU-Tunnel 极盾 E2E 导航版 (V13.0)        "
     say "=================================================="
     echo "  1. 启动并安装服务"
     echo "  2. 停止服务"
@@ -728,7 +734,6 @@ else
             systemctl daemon-reload
             rm -rf "$ETC_DIR" "$LIB_DIR" "$LOG_DIR"
             
-            # 修复：自适应删除 Alpine 或是 Debian/Ubuntu 下的用户，实现纯净物理解理
             if command -v userdel >/dev/null 2>&1; then
                 userdel -r "$SERVICE_USER" || true
             elif command -v deluser >/dev/null 2>&1; then
