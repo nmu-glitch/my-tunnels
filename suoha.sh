@@ -219,12 +219,13 @@ create_env() {
         rm -f "${BIN_DIR}/xtunnel.old" >/dev/null 2>&1 &
     fi
 
-    # 优化支持：如果在 /tmp 已经手动放置了自定义编译的测试版，跳过下载直接使用它
+    # 优先检测本地上传文件，否则从 GitHub 下载不带连字符的编译产物
     if [[ -f "/tmp/xtunnel" ]]; then
         say "检测到本地上传的自定义 xtunnel 核心，跳过远程下载，直接同步部署。"
     else
         say "自 GitHub 仓库同步最新 AES-256-GCM 核心..."
-        curl -fL --retry 3 "https://github.com/nmu-glitch/my-tunnels/releases/download/v1.0.1/x-tunnel-linux-${ARCH}" -o "/tmp/xtunnel" || err "xtunnel 下载失败"
+        # 修复：移除原链接中多余的连字符 x-，修正为实际上传的名称 xtunnel-linux-${ARCH}
+        curl -fL --retry 3 "https://github.com/nmu-glitch/my-tunnels/releases/download/v1.0.1/xtunnel-linux-${ARCH}" -o "/tmp/xtunnel" || err "xtunnel 下载失败"
     fi
     mv -f "/tmp/xtunnel" "${BIN_DIR}/xtunnel"
     
