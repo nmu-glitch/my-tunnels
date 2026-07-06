@@ -10,6 +10,7 @@
 # - 修复：彻底剔除 chown 参数中由于书写偏差残存的空格，保障目录归属权分配顺利完成
 # - 新增：前置 check 检测，不支持 Systemd (如 OpenRC/SysVinit) 的环境将友好终止安装
 # - 新增：支持 AES-256-GCM 密钥交互式配置，支持无缝向下兼容标准未加密传输
+# - 优化：对 GitHub 远程下载逻辑引入 User-Agent 伪装及重定向追踪，解决 404 限制异常
 # =========================================================
 
 APP_NAME="nmu-tunnel"
@@ -219,13 +220,27 @@ create_env() {
         rm -f "${BIN_DIR}/xtunnel.old" >/dev/null 2>&1 &
     fi
 
-    # 优先检测本地上传文件，否则从 GitHub 下载不带连字符的编译产物
+    # 本地自适应多重测试文件检测机制
+    local local_found=false
     if [[ -f "/tmp/xtunnel" ]]; then
-        say "检测到本地上传的自定义 xtunnel 核心，跳过远程下载，直接同步部署。"
+        local_found=true
+    elif [[ -f "/tmp/xtunnel-linux-${ARCH}" ]]; then
+        cp -f "/tmp/xtunnel-linux-${ARCH}" "/tmp/xtunnel"
+        local_found=true
+    fi
+
+    if [ "$local_found" = "true" ]; then
+        say "检测到本地准备好的测试版内核，跳过远程 GitHub 下载。"
     else
+        # 优化下载：构造带 User-Agent 的健壮性 curl 请求，防止被 GitHub 判定为异常请求而拦截
+        local dl_url="https://github.com/nmu-glitch/my-tunnels/releases/download/v1.0.1/xtunnel-linux-${ARCH}"
         say "自 GitHub 仓库同步最新 AES-256-GCM 核心..."
-        # 修复：移除原链接中多余的连字符 x-，修正为实际上传的名称 xtunnel-linux-${ARCH}
-        curl -fL --retry 3 "https://github.com/nmu-glitch/my-tunnels/releases/download/v1.0.1/xtunnel-linux-${ARCH}" -o "/tmp/xtunnel" || err "xtunnel 下载失败"
+        say "下载链接: ${dl_url}"
+        
+        # 显式添加 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        if ! curl -fL --retry 3 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0" "${dl_url}" -o "/tmp/xtunnel"; then
+            err "xtunnel 下载失败，如果海外服务器网络解析存在异常，请手动在本地下载并上传至服务器 /tmp/xtunnel 后重新运行。"
+        fi
     fi
     mv -f "/tmp/xtunnel" "${BIN_DIR}/xtunnel"
     
