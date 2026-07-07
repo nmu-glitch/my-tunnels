@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# NMU Tunnel V13.0 - 生产级极盾 E2E 加密安全加固版
+# NMU Tunnel V13.1 - 极盾 E2E 热更新无感并流版
+# - 修复：优化 env 配置文件解析逻辑，彻底消除局部变量遮蔽，防止追加域名时重复弹窗
 # - 修复：支持最新版双栈 (amd64/arm64) AES-256-GCM 极盾核心
-# - 修复：彻底重构 env 配置文件解析逻辑，以 declare 替换 eval，彻底封堵命令注入漏洞
 # - 修复：重构 Systemd cloudflared/xtunnel 单元，以双美刀 $$ 屏蔽 Systemd 的越权提前展开
 # - 修复：自适应用户创建与删除逻辑，完美兼容 Debian/Ubuntu 和 Alpine Linux 
 # - 修复：将 Systemd 脚本执行引擎修改为全系统通用 /bin/sh，彻底消除极简系统下的路径缺失隐患
 # - 修复：彻底剔除 chown 参数中由于书写偏差残存的空格，保障目录归属权分配顺利完成
 # - 新增：前置 check 检测，不支持 Systemd (如 OpenRC/SysVinit) 的环境将友好终止安装
-# - 新增：支持 AES-256-GCM 密钥交互式配置，支持无缝向下兼容标准未加密传输
-# - 优化：对 GitHub 远程下载逻辑引入 User-Agent 伪装及重定向追踪，解决 404 限制异常
+# - 新增：追加分流规则时自动锁定内部端口与密钥，实现真正无感、不弹窗的热追加
 # =========================================================
 
 APP_NAME="nmu-tunnel"
@@ -24,7 +23,7 @@ SB_SERVICE="nmu-singbox.service"
 XT_SERVICE="nmu-xtunnel.service"
 CF_SERVICE="nmu-cloudflared.service"
 
-say() { echo -e "\033[0;34m[NMU-V13.0]\033[0m $*"; }
+say() { echo -e "\033[0;34m[NMU-V13.1]\033[0m $*"; }
 ok() { echo -e "\033[0;32m[OK]\033[0m $*"; }
 err() { echo -e "\033[0;31m[ERROR]\033[0m $*"; exit 1; }
 
@@ -232,12 +231,11 @@ create_env() {
     if [ "$local_found" = "true" ]; then
         say "检测到本地准备好的测试版内核，跳过远程 GitHub 下载。"
     else
-        # 优化下载：构造带 User-Agent 的健壮性 curl 请求，防止被 GitHub 判定为异常请求而拦截
+        # 构造带 User-Agent 的健壮性 curl 请求，防止被 GitHub 判定为异常请求而拦截
         local dl_url="https://github.com/nmu-glitch/my-tunnels/releases/download/v1.0.1/xtunnel-linux-${ARCH}"
         say "自 GitHub 仓库同步最新 AES-256-GCM 核心..."
         say "下载链接: ${dl_url}"
         
-        # 显式添加 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
         if ! curl -fL --retry 3 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0" "${dl_url}" -o "/tmp/xtunnel"; then
             err "xtunnel 下载失败，如果海外服务器网络解析存在异常，请手动在本地下载并上传至服务器 /tmp/xtunnel 后重新运行。"
         fi
@@ -314,7 +312,7 @@ write_configs() {
     local ws_port="${WS_PORT}"
     local cf_token="${CF_TOKEN}"
     local extra_domains="${EXTRA_DOMAINS}"
-    local secret="${SECRET}" # 获取 E2E 加密密钥
+    local secret="${SECRET}" 
 
     if [[ -z "$token" ]]; then
         if [ -t 0 ]; then
@@ -344,8 +342,21 @@ write_configs() {
         fi
     fi
 
-    local sb_port=$((RANDOM % 10000 + 40001))
-    local m_port=$((RANDOM % 10000 + 30000))
+    # 深度优化：如果配置文件已存在，锁定并继承原有的内部端口，防止重复生成导致端口错位/重复绑定
+    local sb_port=""
+    local m_port=""
+    if [ -f "${ETC_DIR}/env" ]; then
+        while IFS='=' read -r key value; do
+            if [[ "$key" =~ ^[A-Z0-9_]+$ ]]; then
+                value="${value#\"}"
+                value="${value%\"}"
+                if [[ "$key" == "SB_PORT" ]]; then sb_port="$value"; fi
+                if [[ "$key" == "METRICS_PORT" ]]; then m_port="$value"; fi
+            fi
+        done < "${ETC_DIR}/env"
+    fi
+    sb_port=${sb_port:-$((RANDOM % 10000 + 40001))}
+    m_port=${m_port:-$((RANDOM % 10000 + 30000))}
 
     local pvk res endpoint local_addr
     if [ -f "${ETC_DIR}/warp_profile" ]; then
@@ -361,7 +372,7 @@ write_configs() {
     endpoint=${endpoint:-"162.159.192.1"}
     local_addr=${local_addr:-'["172.16.0.2/32"]'}
 
-    # 环境变量持久化保存 (带入 SECRET)
+    # 环境变量保存
     cat > "${ETC_DIR}/env" <<EOF
 WS_PORT="${ws_port}"
 SB_PORT="${sb_port}"
@@ -484,7 +495,6 @@ WantedBy=multi-user.target
 EOF
 
     # 2. xtunnel Unit
-    # 支持一键自适应判断，有密钥时使用 -secret 启动极盾 E2E 加密通道，否则启动普通传输通道
     cat > "/etc/systemd/system/${XT_SERVICE}" <<EOF
 [Unit]
 Description=NMU xtunnel Core
@@ -548,17 +558,19 @@ start_all() {
     systemctl enable "$SB_SERVICE" "$XT_SERVICE" "$CF_SERVICE" >/dev/null 2>&1
 
     local ws_port sb_port metrics_port
+    # 彻底重构读取：改用非遮蔽的模式匹配解析，消除所有局部变量干扰
     if [ -f "${ETC_DIR}/env" ]; then
         while IFS='=' read -r key value; do
             if [[ "$key" =~ ^[A-Z0-9_]+$ ]]; then
                 value="${value#\"}"
                 value="${value%\"}"
-                declare -g "$key"="$value"
+                case "$key" in
+                    WS_PORT) ws_port="$value" ;;
+                    SB_PORT) sb_port="$value" ;;
+                    METRICS_PORT) metrics_port="$value" ;;
+                esac
             fi
         done < "${ETC_DIR}/env"
-        ws_port="$WS_PORT"
-        sb_port="$SB_PORT"
-        metrics_port="$METRICS_PORT"
     fi
     ws_port=${ws_port:-56908}
     sb_port=${sb_port:-40001}
@@ -662,17 +674,23 @@ append_split_domains_menu() {
         err "未检测到已安装的 NMU-Tunnel 配置环境，请先选择选项 1 进行安装。"
     fi
 
-    # 1. 优雅读取当前的运行参数，防止作用域丢失
-    local WS_PORT SB_PORT METRICS_PORT TOKEN CF_TOKEN EXTRA_DOMAINS SECRET
+    # 1. 彻底解决遮蔽Bug：改用安全模式匹配解析，完美还原已有参数，绝不再发生变量遮蔽
+    local cur_ws_port="" cur_token="" cur_cf_token="" cur_extra_domains="" cur_secret=""
     while IFS='=' read -r key value; do
         if [[ "$key" =~ ^[A-Z0-9_]+$ ]]; then
             value="${value#\"}"
             value="${value%\"}"
-            declare -g "$key"="$value"
+            case "$key" in
+                WS_PORT) cur_ws_port="$value" ;;
+                TOKEN) cur_token="$value" ;;
+                CF_TOKEN) cur_cf_token="$value" ;;
+                EXTRA_DOMAINS) cur_extra_domains="$value" ;;
+                SECRET) cur_secret="$value" ;;
+            esac
         fi
     done < "${ETC_DIR}/env"
 
-    local current_extras="${EXTRA_DOMAINS}"
+    local current_extras="${cur_extra_domains}"
     say "当前已配置的追加分流域名: ${current_extras:-无}"
     read -p "请输入需要新增的追加分流域名 (多个用逗号隔开): " new_domains
     [[ -z "$new_domains" ]] && err "输入内容为空，未做任何更改。"
@@ -685,8 +703,13 @@ append_split_domains_menu() {
         merged_extras="${new_domains}"
     fi
 
-    # 3. 动态并流写入
-    TOKEN="$TOKEN" WS_PORT="$WS_PORT" CF_TOKEN="$CF_TOKEN" EXTRA_DOMAINS="$merged_extras" SECRET="$SECRET" write_configs
+    # 3. 将解析出的参数安全载入当前环境，绝不造成弹窗
+    TOKEN="$cur_token" \
+    WS_PORT="$cur_ws_port" \
+    CF_TOKEN="$cur_cf_token" \
+    EXTRA_DOMAINS="$merged_extras" \
+    SECRET="$cur_secret" \
+    write_configs
 
     # 4. 优雅重启 Sing-box 服务应用新规则
     say "正在优雅重启基础路由服务应用新分流规则..."
@@ -700,7 +723,7 @@ append_split_domains_menu() {
 menu() {
     clear
     say "=================================================="
-    say "         NMU-Tunnel 极盾 E2E 导航版 (V13.0)        "
+    say "         NMU-Tunnel 极盾 E2E 导航版 (V13.1)        "
     say "=================================================="
     echo "  1. 启动并安装服务"
     echo "  2. 停止服务"
