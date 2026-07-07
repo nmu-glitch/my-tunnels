@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# NMU Tunnel V13.1 - 极盾 E2E 热更新无感并流版
+# NMU Tunnel V13.2 - 极盾 E2E 全局快捷导航版
 # - 修复：优化 env 配置文件解析逻辑，彻底消除局部变量遮蔽，防止追加域名时重复弹窗
 # - 修复：支持最新版双栈 (amd64/arm64) AES-256-GCM 极盾核心
 # - 修复：重构 Systemd cloudflared/xtunnel 单元，以双美刀 $$ 屏蔽 Systemd 的越权提前展开
@@ -10,6 +10,8 @@
 # - 修复：彻底剔除 chown 参数中由于书写偏差残存的空格，保障目录归属权分配顺利完成
 # - 新增：前置 check 检测，不支持 Systemd (如 OpenRC/SysVinit) 的环境将友好终止安装
 # - 新增：追加分流规则时自动锁定内部端口与密钥，实现真正无感、不弹窗的热追加
+# - 新增：全局快捷命令 'nmu'，注册后在终端任意路径输入 nmu 即可秒开菜单
+# - 新增：菜单防退出循环，所有操作结束后按任意键优雅返回主菜单
 # =========================================================
 
 APP_NAME="nmu-tunnel"
@@ -23,7 +25,7 @@ SB_SERVICE="nmu-singbox.service"
 XT_SERVICE="nmu-xtunnel.service"
 CF_SERVICE="nmu-cloudflared.service"
 
-say() { echo -e "\033[0;34m[NMU-V13.1]\033[0m $*"; }
+say() { echo -e "\033[0;34m[NMU-V13.2]\033[0m $*"; }
 ok() { echo -e "\033[0;32m[OK]\033[0m $*"; }
 err() { echo -e "\033[0;31m[ERROR]\033[0m $*"; exit 1; }
 
@@ -31,6 +33,19 @@ require_root() {
     [[ "$(id -u)" -ne 0 ]] && err "请使用 root 权限执行 (sudo $0)"
     if ! command -v systemctl >/dev/null 2>&1; then
         err "此脚本依赖 systemd 进程管理器。当前系统不支持 systemd（如原生 OpenRC 或 Docker 容器环境），无法运行。"
+    fi
+}
+
+# --- 自动生成全局快捷键 'nmu' 命令 ---
+create_shortcut() {
+    if [[ "$(id -u)" -eq 0 ]]; then
+        local script_path
+        script_path=$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")
+        if [[ -n "$script_path" && -f "$script_path" ]]; then
+            ln -sf "$script_path" /usr/local/bin/nmu 2>/dev/null || true
+            chmod +x /usr/local/bin/nmu 2>/dev/null || true
+            chmod +x "$script_path" 2>/dev/null || true
+        fi
     fi
 }
 
@@ -558,7 +573,7 @@ start_all() {
     systemctl enable "$SB_SERVICE" "$XT_SERVICE" "$CF_SERVICE" >/dev/null 2>&1
 
     local ws_port sb_port metrics_port
-    # 彻底重构读取：改用非遮蔽的模式匹配解析，消除所有局部变量干扰
+    # 重构读取：改用非遮蔽的模式匹配解析，消除所有局部变量干扰
     if [ -f "${ETC_DIR}/env" ]; then
         while IFS='=' read -r key value; do
             if [[ "$key" =~ ^[A-Z0-9_]+$ ]]; then
@@ -674,7 +689,7 @@ append_split_domains_menu() {
         err "未检测到已安装的 NMU-Tunnel 配置环境，请先选择选项 1 进行安装。"
     fi
 
-    # 1. 彻底解决遮蔽Bug：改用安全模式匹配解析，完美还原已有参数，绝不再发生变量遮蔽
+    # 彻底解决遮蔽Bug：改用安全模式匹配解析，完美还原已有参数，绝不再发生变量遮蔽
     local cur_ws_port="" cur_token="" cur_cf_token="" cur_extra_domains="" cur_secret=""
     while IFS='=' read -r key value; do
         if [[ "$key" =~ ^[A-Z0-9_]+$ ]]; then
@@ -695,7 +710,7 @@ append_split_domains_menu() {
     read -p "请输入需要新增的追加分流域名 (多个用逗号隔开): " new_domains
     [[ -z "$new_domains" ]] && err "输入内容为空，未做任何更改。"
 
-    # 2. 合并新旧追加域名组
+    # 合并新旧追加域名组
     local merged_extras
     if [[ -n "$current_extras" ]]; then
         merged_extras="${current_extras},${new_domains}"
@@ -703,7 +718,7 @@ append_split_domains_menu() {
         merged_extras="${new_domains}"
     fi
 
-    # 3. 将解析出的参数安全载入当前环境，绝不造成弹窗
+    # 将解析出的参数安全载入当前环境，绝不造成弹窗
     TOKEN="$cur_token" \
     WS_PORT="$cur_ws_port" \
     CF_TOKEN="$cur_cf_token" \
@@ -711,7 +726,7 @@ append_split_domains_menu() {
     SECRET="$cur_secret" \
     write_configs
 
-    # 4. 优雅重启 Sing-box 服务应用新规则
+    # 优雅重启 Sing-box 服务应用新规则
     say "正在优雅重启基础路由服务应用新分流规则..."
     systemctl restart "$SB_SERVICE"
     
@@ -721,27 +736,58 @@ append_split_domains_menu() {
 
 # --- 9. 经典交互式 TTY 菜单 ---
 menu() {
-    clear
-    say "=================================================="
-    say "         NMU-Tunnel 极盾 E2E 导航版 (V13.1)        "
-    say "=================================================="
-    echo "  1. 启动并安装服务"
-    echo "  2. 停止服务"
-    echo "  3. 实时查看日志"
-    echo "  4. 完全物理卸载"
-    echo "  5. 追加分流域名 (不破坏现有环境/即时生效)"
-    echo "  0. 退出"
-    say "=================================================="
-    local choice
-    read -p "选择操作 [0-5]: " choice
-    case "${choice:-1}" in
-        1) run_install_interactive ;;
-        2) stop_services_menu ;;
-        3) view_logs_menu ;;
-        4) uninstall_menu ;;
-        5) append_split_domains_menu ;;
-        *) exit 0 ;;
-    esac
+    create_shortcut # 每次进入菜单时自动尝试注册/刷新 'nmu' 快捷指令
+    
+    while true; do
+        clear
+        say "=================================================="
+        say "         NMU-Tunnel 极盾 E2E 导航版 (V13.2)        "
+        say "  [提示] 终端任意路径输入 'nmu' 即可直接唤醒此菜单   "
+        say "=================================================="
+        echo "  1. 启动并安装服务"
+        echo "  2. 停止服务"
+        echo "  3. 实时查看日志 (退出日志请按 Ctrl+C)"
+        echo "  4. 完全物理卸载"
+        echo "  5. 追加分流域名 (不破坏现有环境/即时生效)"
+        echo "  0. 退出"
+        say "=================================================="
+        local choice
+        read -p "选择操作 [0-5]: " choice
+        case "${choice:-1}" in
+            1) 
+                run_install_interactive 
+                echo
+                read -n 1 -s -r -p "按任意键返回主菜单..."
+                ;;
+            2) 
+                stop_services_menu 
+                echo
+                read -n 1 -s -r -p "按任意键返回主菜单..."
+                ;;
+            3) 
+                view_logs_menu 
+                echo
+                read -n 1 -s -r -p "按任意键返回主菜单..."
+                ;;
+            4) 
+                uninstall_menu 
+                echo
+                read -n 1 -s -r -p "按任意键返回主菜单..."
+                ;;
+            5) 
+                append_split_domains_menu 
+                echo
+                read -n 1 -s -r -p "按任意键返回主菜单..."
+                ;;
+            0) 
+                exit 0 
+                ;;
+            *) 
+                say "无效的选择，请重新输入。"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 # --- 运行入口 (自动识别无参数会话和有参数自动化流水线) ---
