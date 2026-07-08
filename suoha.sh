@@ -2,14 +2,14 @@
 
 # =========================================================
 # NMU Tunnel V13.2 - 极盾 E2E 全局快捷导航版 (深度安全与生存性能加固版)
-# - 优化：移除外部 tr 与 xargs 依赖，改用纯 Bash 参数展开实现零分叉字符净化，彻底防范特殊符号报错 [3]
-# - 优化：配置环境读取逻辑支持逆向转义还原，彻底解决追加域名时反斜杠的指数级膨胀问题
+# - 优化：移除外部 tr 与 xargs 依赖，改用纯 Bash 参数展开实现零分叉字符净化 [3]
+# - 优化：配置环境读取逻辑支持正则捕获首等号切割，彻底防范 base64 或密钥含有等号 "=" 时的解析中断和数据损毁
 # - 优化：pkill 采用精确名称匹配机制，消除安装脚本自身在特定路径下运行时被误杀自尽的隐患
 # - 优化：增强 Systemd EnvironmentFile 敏感值转义，防止特殊密码导致 Systemd 加载词法错误
-# - 修复：优化 env 配置文件解析逻辑，彻底消除局部变量遮蔽，防止追加域名时重复弹窗
+# - 优化：通过自适应检测 $BIN_DIR/xtunnel 的存在状态，防止追加分流域名时误覆盖自编译的读写分离安全内核
 # - 修复：支持最新版双栈 (amd64/arm64) AES-256-GCM 极盾核心
 # - 修复：重构 Systemd cloudflared/xtunnel 单元，以双美刀 $$ 屏蔽 Systemd 的越权提前展开
-# - 修复：自适应用户创建与删除逻辑，完美兼容 Debian/Ubuntu 和 Alpine Linux 
+# - 修复：自适应用户创建与删除逻辑，自动探查系统 nologin 绝对路径（Debian/CentOS/Alpine）并优雅回落
 # - 修复：将 Systemd 脚本执行引擎修改为全系统通用 /bin/sh，彻底消除极简系统下的路径缺失隐患
 # - 修复：彻底剔除 chown 参数中由于书写偏差残存的空格，保障目录归属权分配顺利完成
 # - 新增：前置 check 检测，不支持 Systemd (如 OpenRC/SysVinit) 的环境将友好终止安装
@@ -226,12 +226,20 @@ create_env() {
     systemctl stop "$CF_SERVICE" "$XT_SERVICE" "$SB_SERVICE" >/dev/null 2>&1 || true
     kill_process_native
     
+    # 自动检索系统可用的无登录 shell，提升跨发行版（包括 Alpine / CentOS / Debian）下的环境兼容度
+    local nologin_path="/bin/false"
+    if [[ -f "/usr/sbin/nologin" ]]; then
+        nologin_path="/usr/sbin/nologin"
+    elif [[ -f "/sbin/nologin" ]]; then
+        nologin_path="/sbin/nologin"
+    fi
+
     # 兼容性逻辑：自适应用户创建逻辑，完美兼容 Debian/Ubuntu 和 Alpine Linux
     if ! id "$SERVICE_USER" >/dev/null 2>&1; then
         if command -v useradd >/dev/null 2>&1; then
-            useradd -r -m -d "$LIB_DIR" -s /usr/sbin/nologin "$SERVICE_USER" || err "用户创建失败"
+            useradd -r -m -d "$LIB_DIR" -s "$nologin_path" "$SERVICE_USER" || err "用户创建失败"
         elif command -v adduser >/dev/null 2>&1; then
-            adduser -S -h "$LIB_DIR" -s /sbin/nologin -D "$SERVICE_USER" || err "用户创建失败"
+            adduser -S -h "$LIB_DIR" -s "$nologin_path" -D "$SERVICE_USER" || err "用户创建失败"
         else
             err "未找到可用的用户创建命令"
         fi
@@ -246,33 +254,41 @@ create_env() {
     
     # --- XTUNNEL 同步 ---
     say "正在同步 xtunnel 核心..."
+    local need_download=true
     if [[ -f "${BIN_DIR}/xtunnel" ]]; then
-        mv -f "${BIN_DIR}/xtunnel" "${BIN_DIR}/xtunnel.old" >/dev/null 2>&1 || true
-        rm -f "${BIN_DIR}/xtunnel.old" >/dev/null 2>&1 &
-    fi
-
-    # 本地自适应多重测试文件检测机制
-    local local_found=false
-    if [[ -f "/tmp/xtunnel" ]]; then
-        local_found=true
-    elif [[ -f "/tmp/xtunnel-linux-${ARCH}" ]]; then
-        cp -f "/tmp/xtunnel-linux-${ARCH}" "/tmp/xtunnel"
-        local_found=true
-    fi
-
-    if [ "$local_found" = "true" ]; then
-        say "检测到本地准备好的测试版内核，跳过远程 GitHub 下载。"
-    else
-        # 构造带 User-Agent 的健壮性 curl 请求，防止被 GitHub 判定为异常请求而拦截
-        local dl_url="https://github.com/nmu-glitch/my-tunnels/releases/download/v1.0.1/xtunnel-linux-${ARCH}"
-        say "自 GitHub 仓库同步最新 AES-256-GCM 核心..."
-        say "下载链接: ${dl_url}"
-        
-        if ! curl -fL --retry 3 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0" "${dl_url}" -o "/tmp/xtunnel"; then
-            err "xtunnel 下载失败，如果海外服务器网络解析存在异常，请手动在本地下载并上传至服务器 /tmp/xtunnel 后重新运行。"
+        # 哨兵策略：防止重新运行时覆盖用户自己在本地重新编译的读写分离安全版 xtunnel 核心
+        if [[ ! -f "/tmp/xtunnel" && ! -f "/tmp/xtunnel-linux-${ARCH}" ]]; then
+            say "检测到本地已存在自编译/优化的 xtunnel 安全核心，跳过远程下载以防覆盖。"
+            need_download=false
+        else
+            mv -f "${BIN_DIR}/xtunnel" "${BIN_DIR}/xtunnel.old" >/dev/null 2>&1 || true
+            rm -f "${BIN_DIR}/xtunnel.old" >/dev/null 2>&1 &
         fi
     fi
-    mv -f "/tmp/xtunnel" "${BIN_DIR}/xtunnel"
+
+    if [ "$need_download" = "true" ]; then
+        local local_found=false
+        if [[ -f "/tmp/xtunnel" ]]; then
+            local_found=true
+        elif [[ -f "/tmp/xtunnel-linux-${ARCH}" ]]; then
+            cp -f "/tmp/xtunnel-linux-${ARCH}" "/tmp/xtunnel"
+            local_found=true
+        fi
+
+        if [ "$local_found" = "true" ]; then
+            say "检测到本地准备好的测试版内核，跳过远程 GitHub 下载。"
+        else
+            # 构造带 User-Agent 的健壮性 curl 请求，防止被 GitHub 判定为异常请求而拦截
+            local dl_url="https://github.com/nmu-glitch/my-tunnels/releases/download/v1.0.1/xtunnel-linux-${ARCH}"
+            say "自 GitHub 仓库同步最新 AES-256-GCM 核心..."
+            say "下载链接: ${dl_url}"
+            
+            if ! curl -fL --retry 3 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0" "${dl_url}" -o "/tmp/xtunnel"; then
+                err "xtunnel 下载失败，如果海外服务器网络解析存在异常，请手动在本地下载并上传至服务器 /tmp/xtunnel 后重新运行。"
+            fi
+        fi
+        mv -f "/tmp/xtunnel" "${BIN_DIR}/xtunnel"
+    fi
     
     # --- CLOUDFLARED 同步 ---
     say "正在同步 cloudflared 核心..."
@@ -378,13 +394,14 @@ write_configs() {
     local sb_port=""
     local m_port=""
     if [ -f "${ETC_DIR}/env" ]; then
-        # 采用纯 Bash 内存处理，并在剥除外层引号后执行逆向转义还原，彻底拦截追加配置时转义字符的指数级膨胀
-        while IFS='=' read -r key value || [[ -n "$key" ]]; do
-            key="${key//$'\r'/}"
-            value="${value//$'\r'/}"
-            key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
-            value="${value#"${value%%[![:space:]]*}"}"; value="${value%"${value##*[![:space:]]}"}"
-            if [[ "$key" =~ ^[A-Z0-9_]+$ ]]; then
+        # 采用纯 Bash 正则表达式匹配机制提取第一个 "=" 符号两边的键值，解决 token 或 secret 中包含 "=" 时造成的截断损坏缺陷 [3]
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+            if [[ "$line" =~ ^([A-Z0-9_]+)=(.*)$ ]]; then
+                local key="${BASH_REMATCH[1]}"
+                local value="${BASH_REMATCH[2]}"
+                value="${value//$'\r'/}"
                 value="${value#\"}"
                 value="${value%\"}"
                 value="${value//\\\"/\"}"
@@ -438,35 +455,31 @@ EOF
 
     # 清洗追加分流
     if [[ -n "$extra_domains" ]]; then
-        local clean_extras
-        clean_extras=$(echo "$extra_domains" | tr ',' ' ' | tr -d '"' | tr -d "'")
-        if [[ -n "$clean_extras" ]]; then
-            set -f # 临时禁用通配符展开，防止含有*等字符时在未引号循环中引发目录文件爆破与意外展开
-            for d in $clean_extras; do
-                set +f # 进入循环体立即恢复，保障子进程行为正常
-                d="${d#"${d%%[![:space:]]*}"}"; d="${d%"${d##*[![:space:]]}"}"
-                if [[ -n "$d" ]]; then
-                    local is_duplicate=false
-                    for bd in "${base_domains[@]}"; do
-                        if [[ "$d" == "$bd" ]]; then
-                            is_duplicate=true
-                            break
-                        fi
-                    done
-                    for ad in "${domain_array[@]}"; do
-                        if [[ "\"$d\"" == "$ad" ]]; then
-                            is_duplicate=true
-                            break
-                        fi
-                    done
-                    if [ "$is_duplicate" = "false" ]; then
-                        domain_array+=("\"$d\"")
+        # 利用 Bash read 数组功能安全地按分隔符分裂字符串，免除 set -f 导致的全局会话通配符失效副作用 [3]
+        local extra_array
+        read -r -a extra_array <<< "${extra_domains//,/ }"
+        for d in "${extra_array[@]}"; do
+            # 纯 Bash 剥除外侧空格
+            d="${d#"${d%%[![:space:]]*}"}"; d="${d%"${d##*[![:space:]]}"}"
+            if [[ -n "$d" ]]; then
+                local is_duplicate=false
+                for bd in "${base_domains[@]}"; do
+                    if [[ "$d" == "$bd" ]]; then
+                        is_duplicate=true
+                        break
                     fi
+                done
+                for ad in "${domain_array[@]}"; do
+                    if [[ "\"$d\"" == "$ad" ]]; then
+                        is_duplicate=true
+                        break
+                    fi
+                done
+                if [ "$is_duplicate" = "false" ]; then
+                    domain_array+=("\"$d\"")
                 fi
-                set -f # 为下一次循环判定准备
-            done
-            set +f # 恢复系统全局状态
-        fi
+            fi
+        done
     fi
 
     local domains
@@ -626,14 +639,15 @@ start_all() {
     systemctl enable "$SB_SERVICE" "$XT_SERVICE" "$CF_SERVICE" >/dev/null 2>&1
 
     local ws_port sb_port metrics_port
-    # 重构读取：采用纯 Bash 零分叉匹配解析并过滤反斜杠转义，消除所有局部变量干扰并防御 CRLF 换行符
+    # 重构读取：采用纯 Bash 正则表达式提取首个等号前后的键值对，防御包含等号的 Token 与密钥，且过滤 CRLF 换行符
     if [ -f "${ETC_DIR}/env" ]; then
-        while IFS='=' read -r key value || [[ -n "$key" ]]; do
-            key="${key//$'\r'/}"
-            value="${value//$'\r'/}"
-            key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
-            value="${value#"${value%%[![:space:]]*}"}"; value="${value%"${value##*[![:space:]]}"}"
-            if [[ "$key" =~ ^[A-Z0-9_]+$ ]]; then
+         while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+            if [[ "$line" =~ ^([A-Z0-9_]+)=(.*)$ ]]; then
+                local key="${BASH_REMATCH[1]}"
+                local value="${BASH_REMATCH[2]}"
+                value="${value//$'\r'/}"
                 value="${value#\"}"
                 value="${value%\"}"
                 value="${value//\\\"/\"}"
@@ -748,14 +762,15 @@ append_split_domains_menu() {
         err "未检测到已安装的 NMU-Tunnel 配置环境，请先选择选项 1 进行安装。"
     fi
 
-    # 彻底解决遮蔽Bug：改用纯 Bash 参数匹配解析并还原转义字符，完美还原已有参数，防御 CRLF 与无换行边界
+    # 彻底解决局部命名遮蔽缺陷：采用纯 Bash 正则表达式提取第一个 "=" 键值，完美复原 Base64 加解密凭证，屏蔽换行符干扰
     local cur_ws_port="" cur_token="" cur_cf_token="" cur_extra_domains="" cur_secret=""
-    while IFS='=' read -r key value || [[ -n "$key" ]]; do
-        key="${key//$'\r'/}"
-        value="${value//$'\r'/}"
-        key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
-        value="${value#"${value%%[![:space:]]*}"}"; value="${value%"${value##*[![:space:]]}"}"
-        if [[ "$key" =~ ^[A-Z0-9_]+$ ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        if [[ "$line" =~ ^([A-Z0-9_]+)=(.*)$ ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local value="${BASH_REMATCH[2]}"
+            value="${value//$'\r'/}"
             value="${value#\"}"
             value="${value%\"}"
             value="${value//\\\"/\"}"
@@ -783,7 +798,7 @@ append_split_domains_menu() {
         merged_extras="${new_domains}"
     fi
 
-    # 将解析出的参数安全载入当前环境，绝不造成弹窗
+    # 将解析出的参数安全载入当前环境，避免因多余的分流添加导致重新弹窗询问连接口令
     TOKEN="$cur_token" \
     WS_PORT="$cur_ws_port" \
     CF_TOKEN="$cur_cf_token" \
