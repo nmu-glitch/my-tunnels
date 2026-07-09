@@ -361,6 +361,7 @@ write_configs() {
     local cf_token="${CF_TOKEN}"
     local extra_domains="${EXTRA_DOMAINS}"
     local secret="${SECRET}" 
+	local fallback_proxy="${FALLBACK_PROXY}" # 👈 新增
 
     if [[ -z "$token" ]]; then
         if [ -t 0 ]; then
@@ -408,6 +409,7 @@ write_configs() {
                 value="${value//\\\\/\\}"
                 if [[ "$key" == "SB_PORT" ]]; then sb_port="$value"; fi
                 if [[ "$key" == "METRICS_PORT" ]]; then m_port="$value"; fi
+				if [[ "$key" == "FALLBACK_PROXY" ]]; then fallback_proxy="$value"; fi # 👈 新增
             fi
         done < "${ETC_DIR}/env"
     fi
@@ -429,11 +431,12 @@ write_configs() {
     local_addr=${local_addr:-'["172.16.0.2/32"]'}
 
     # 对写入 EnvironmentFile 的敏感值进行双引号与反斜杠安全转义，防止 Systemd 加载词法断裂
-    local esc_token esc_cf_token esc_extra_domains esc_secret
+    local esc_token esc_cf_token esc_extra_domains esc_secret esc_fallback_proxy
     esc_token="${token//\\/\\\\}"; esc_token="${esc_token//\"/\\\"}"
     esc_cf_token="${cf_token//\\/\\\\}"; esc_cf_token="${esc_cf_token//\"/\\\"}"
     esc_extra_domains="${extra_domains//\\/\\\\}"; esc_extra_domains="${esc_extra_domains//\"/\\\"}"
     esc_secret="${secret//\\/\\\\}"; esc_secret="${esc_secret//\"/\\\"}"
+    esc_fallback_proxy="${fallback_proxy//\\/\\\\}"; esc_fallback_proxy="${esc_fallback_proxy//\"/\\\"}" # 👈 新增
 
     # 环境变量保存
     cat > "${ETC_DIR}/env" <<EOF
@@ -444,6 +447,7 @@ TOKEN="${esc_token}"
 CF_TOKEN="${esc_cf_token}"
 EXTRA_DOMAINS="${esc_extra_domains}"
 SECRET="${esc_secret}"
+FALLBACK_PROXY="${esc_fallback_proxy}"
 EOF
 
     # 基础分流，不侵扰原有链路
@@ -568,7 +572,7 @@ PartOf=${SB_SERVICE}
 
 [Service]
 EnvironmentFile=${ETC_DIR}/env
-ExecStart=/bin/sh -c 'if [ -n "\$\$SECRET" ]; then exec ${BIN_DIR}/xtunnel -l ws://127.0.0.1:\$\$WS_PORT -token "\$\$TOKEN" -f socks5://127.0.0.1:\$\$SB_PORT -secret "\$\$SECRET"; else exec ${BIN_DIR}/xtunnel -l ws://127.0.0.1:\$\$WS_PORT -token "\$\$TOKEN" -f socks5://127.0.0.1:\$\$SB_PORT; fi'
+ExecStart=/bin/sh -c 'if [ -n "\$\$SECRET" ]; then exec ${BIN_DIR}/xtunnel -l ws://127.0.0.1:\$\$WS_PORT -token "\$\$TOKEN" -f socks5://127.0.0.1:\$\$SB_PORT -secret "\$\$SECRET" -fallback-proxy "\$\$FALLBACK_PROXY"; else exec ${BIN_DIR}/xtunnel -l ws://127.0.0.1:\$\$WS_PORT -token "\$\$TOKEN" -f socks5://127.0.0.1:\$\$SB_PORT -fallback-proxy "\$\$FALLBACK_PROXY"; fi'
 User=${SERVICE_USER}
 Restart=always
 RestartSec=3
@@ -713,12 +717,15 @@ run_install_interactive() {
     read -p "3. CF Tunnel Token (留空用临时域名): " cf_token
     read -p "4. 追加分流域名 (用逗号隔开，不改变默认分流): " extra_domains
     read -p "5. AES-256-GCM 极盾对称密钥 (留空则不开启对称加密): " secret
+    read -p "6. 主动探测反向代理伪装目标 (直接回车默认 https://httpbin.org): " fallback_proxy
+    fallback_proxy=${fallback_proxy:-https://httpbin.org} # 如果用户直接回车，赋予默认伪装站
 
     TOKEN="$token"
     WS_PORT="$ws_port"
     CF_TOKEN="$cf_token"
     EXTRA_DOMAINS="$extra_domains"
     SECRET="$secret"
+	FALLBACK_PROXY="$fallback_proxy" # 👈 新增传递
 
     write_configs
     write_units
@@ -763,7 +770,7 @@ append_split_domains_menu() {
     fi
 
     # 彻底解决局部命名遮蔽缺陷：采用纯 Bash 正则表达式提取第一个 "=" 键值，完美复原 Base64 加解密凭证，屏蔽换行符干扰
-    local cur_ws_port="" cur_token="" cur_cf_token="" cur_extra_domains="" cur_secret=""
+    local cur_ws_port="" cur_token="" cur_cf_token="" cur_extra_domains="" cur_secret="" cur_fallback_proxy="" # 👈 新增
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         [[ "$line" =~ ^[[:space:]]*$ ]] && continue
@@ -781,6 +788,7 @@ append_split_domains_menu() {
                 CF_TOKEN) cur_cf_token="$value" ;;
                 EXTRA_DOMAINS) cur_extra_domains="$value" ;;
                 SECRET) cur_secret="$value" ;;
+                FALLBACK_PROXY) cur_fallback_proxy="$value" ;; # 👈 新增
             esac
         fi
     done < "${ETC_DIR}/env"
@@ -804,6 +812,7 @@ append_split_domains_menu() {
     CF_TOKEN="$cur_cf_token" \
     EXTRA_DOMAINS="$merged_extras" \
     SECRET="$cur_secret" \
+    FALLBACK_PROXY="$cur_fallback_proxy" \
     write_configs
 
     # 优雅重启 Sing-box 服务应用新规则
