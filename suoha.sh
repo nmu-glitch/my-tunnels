@@ -179,9 +179,9 @@ EOF
 
 # --- 3. 进程原生切断器 & 动态版本探针 ---
 kill_process_native() {
-    local proc_patterns=("cloudflared" "xtunnel" "singbox")
+    # 👈 核心加固：同步加入带连字符的标准 "sing-box" 进程特征，防止残留套接字导致重启绑定失败
+    local proc_patterns=("cloudflared" "xtunnel" "sing-box" "singbox")
     for pattern in "${proc_patterns[@]}"; do
-        # 使用 -x (精确名称匹配) 替代 -f (全文命令行匹配)，防止安装脚本因其路径或名称包含关键字而被意外 Self-Kill 故障
         pkill -9 -x "$pattern" >/dev/null 2>&1 || true
         local pids
         pids=$(pgrep -x "$pattern" 2>/dev/null || true)
@@ -350,6 +350,58 @@ create_env() {
     fi
 
     chown -R "$SERVICE_USER":"$SERVICE_USER" "$LIB_DIR" "$LOG_DIR" || err "权限归属分配失败"
+    
+    # 👈 核心新增：自动触发系统层 UDP/QUIC 加速优化
+    optimize_network_for_quic
+}
+
+# 🚀 核心新增：系统层 UDP/QUIC 极限加速与物理防火墙自适应放行函数
+optimize_network_for_quic() {
+    say "正在执行 QUIC / UDP 内核级传输加速与出站放行..."
+
+    # 1. 扩容 Linux 内核 UDP 缓冲区并优化慢启动限制
+    if [ -f "/etc/sysctl.conf" ]; then
+        if [ ! -f "/etc/sysctl.conf.bak_nmu" ]; then
+            cp /etc/sysctl.conf /etc/sysctl.conf.bak_nmu
+        fi
+        
+        declare -A params=(
+            ["net.core.rmem_max"]="67108864"
+            ["net.core.wmem_max"]="67108864"
+            ["net.ipv4.tcp_rmem"]="4096 87380 67108864"
+            ["net.ipv4.tcp_wmem"]="4096 65536 67108864"
+            ["net.ipv4.tcp_slow_start_after_idle"]="0"
+        )
+        
+        for key in "${!params[@]}"; do
+            value="${params[$key]}"
+            if grep -q "^$key" /etc/sysctl.conf; then
+                sed -i "s|^$key.*|$key = $value|g" /etc/sysctl.conf
+            else
+                echo "$key = $value" >> /etc/sysctl.conf
+            fi
+        done
+        sysctl -p >/dev/null 2>&1 || true
+        ok "系统内核级 UDP 滑动缓冲区扩容（64MB）与慢启动消除已就绪。"
+    fi
+
+    # 2. 自适应放行本地防火墙的 UDP 7844 端口（保证 QUIC 隧道不退化）
+    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "active"; then
+        ufw allow out 7844/udp >/dev/null 2>&1 && ok "UFW 已成功放行 UDP 7844 出站通道。"
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+        firewall-cmd --permanent --direct --add-rule ipv4 filter OUTPUT 0 -p udp --dport 7844 -j ACCEPT >/dev/null 2>&1
+        firewall-cmd --permanent --direct --add-rule ipv6 filter OUTPUT 0 -p udp --dport 7844 -j ACCEPT >/dev/null 2>&1
+        firewall-cmd --reload >/dev/null 2>&1
+        ok "Firewalld 已成功放行 UDP 7844 出站通道。"
+    fi
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -C OUTPUT -p udp --dport 7844 -j ACCEPT >/dev/null 2>&1 || iptables -A OUTPUT -p udp --dport 7844 -j ACCEPT
+    fi
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -C OUTPUT -p udp --dport 7844 -j ACCEPT >/dev/null 2>&1 || ip6tables -A OUTPUT -p udp --dport 7844 -j ACCEPT
+    fi
+    ok "物理防火墙出站安全链配置完成。"
 }
 
 # --- 4. 配置文件生成与安全并流算法 ---
@@ -361,7 +413,8 @@ write_configs() {
     local cf_token="${CF_TOKEN}"
     local extra_domains="${EXTRA_DOMAINS}"
     local secret="${SECRET}" 
-	local fallback_proxy="${FALLBACK_PROXY}" # 👈 新增
+	local fallback_proxy="${FALLBACK_PROXY}" 
+	fallback_proxy=${fallback_proxy:-https://www.debian.org} # 👈 哨兵优化：确保在非交互模式下也有合法的默认伪装站点
 
     if [[ -z "$token" ]]; then
         if [ -t 0 ]; then
@@ -551,6 +604,7 @@ write_units() {
 [Unit]
 Description=NMU Singbox Base
 After=network.target
+Wants=${XT_SERVICE} # 👈 核心优化：确保启动/重启路由层时，自动级联拉起 xtunnel 桥接层
 
 [Service]
 ExecStart=${BIN_DIR}/singbox run -c ${ETC_DIR}/singbox.json
@@ -569,6 +623,7 @@ Description=NMU xtunnel Core
 After=network.target ${SB_SERVICE}
 Requires=${SB_SERVICE}
 PartOf=${SB_SERVICE}
+Wants=${CF_SERVICE} # 👈 核心优化：确保桥接层就绪后，自动级联拉起 cloudflared 出口层
 
 [Service]
 EnvironmentFile=${ETC_DIR}/env
@@ -591,7 +646,8 @@ PartOf=${XT_SERVICE}
 
 [Service]
 EnvironmentFile=${ETC_DIR}/env
-ExecStart=/bin/sh -c 'if [ -n "\$\$CF_TOKEN" ]; then exec ${BIN_DIR}/cloudflared tunnel run --token \$\$CF_TOKEN; else exec ${BIN_DIR}/cloudflared tunnel --url http://127.0.0.1:\$\$WS_PORT --metrics 127.0.0.1:\$\$METRICS_PORT; fi'
+# 👈 核心优化：在 ExecStart 的两条回源分支中均强行注入 --protocol quic 参数，强行锁死高吞吐车道
+ExecStart=/bin/sh -c 'if [ -n "\$\$CF_TOKEN" ]; then exec ${BIN_DIR}/cloudflared --protocol quic tunnel run --token \$\$CF_TOKEN; else exec ${BIN_DIR}/cloudflared --protocol quic tunnel --url http://127.0.0.1:\$\$WS_PORT --metrics 127.0.0.1:\$\$METRICS_PORT; fi'
 User=${SERVICE_USER}
 Restart=always
 RestartSec=5
@@ -717,8 +773,8 @@ run_install_interactive() {
     read -p "3. CF Tunnel Token (留空用临时域名): " cf_token
     read -p "4. 追加分流域名 (用逗号隔开，不改变默认分流): " extra_domains
     read -p "5. AES-256-GCM 极盾对称密钥 (留空则不开启对称加密): " secret
-    read -p "6. 主动探测反向代理伪装目标 (直接回车默认 https://httpbin.org): " fallback_proxy
-    fallback_proxy=${fallback_proxy:-https://httpbin.org} # 如果用户直接回车，赋予默认伪装站
+    read -p "6. 主动探测反向代理伪装目标 (直接回车默认 https://www.debian.org): " fallback_proxy
+    fallback_proxy=${fallback_proxy:-https://www.debian.org} # 如果用户直接回车，赋予默认伪装站
 
     TOKEN="$token"
     WS_PORT="$ws_port"
@@ -816,8 +872,8 @@ append_split_domains_menu() {
     write_configs
 
     # 优雅重启 Sing-box 服务应用新规则
-    say "正在优雅重启基础路由服务应用新分流规则..."
-    systemctl restart "$SB_SERVICE"
+    say "正在平滑热重启级联路由服务以应用新分流规则..."
+    systemctl restart "$SB_SERVICE" "$XT_SERVICE"
     
     ok "分流规则追加成功！新规则已即时生效。"
     say "当前最新合并追加域名列表: $merged_extras"
