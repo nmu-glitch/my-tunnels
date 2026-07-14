@@ -483,21 +483,30 @@ write_configs() {
       "listen_port": ${SB_PORT}
     }
   ],
+  "endpoints": [
+    {
+      "type": "wireguard",
+      "tag": "warp",
+      "system": false,
+      "mtu": 1360,
+      "address": ${local_addr},
+      "private_key": "${pvk}",
+      "peers": [
+        {
+          "address": "${endpoint}",
+          "port": 2408,
+          "public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+          "allowed_ips": ["0.0.0.0/0", "::/0"],
+          "persistent_keepalive_interval": 25,
+          "reserved": ${res}
+        }
+      ]
+    }
+  ],
   "outbounds": [
     {
       "type": "direct",
       "tag": "direct"
-    },
-    {
-      "type": "wireguard",
-      "tag": "warp",
-      "server": "${endpoint}",
-      "server_port": 2408,
-      "local_address": ${local_addr},
-      "private_key": "${pvk}",
-      "peer_public_key": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-      "reserved": ${res},
-      "mtu": 1360
     }
   ],
   "route": { 
