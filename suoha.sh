@@ -4,6 +4,8 @@
 # NMU Tunnel V13.2 - 终极并流加固版 (中文交互与军工级安全底座双闭环)
 # =================================================================
 # - 安全：采用 7.41 版严格的 set -Eeuo pipefail 错误检测与信号陷阱
+# - 安全：修复在 set -E 状态下 ufw/firewalld 禁用引发 trap ERR 的熔断自尽 Bug
+# - 安全：修复首装未发现 singbox 时 get_local_sb_version 返回 1 导致的安装中断
 # - 安全：部署 umask 027，强制收缩 /etc/nmu-tunnel/env 等高密密钥盘权限为 0640
 # - 安全：所有配置文件和 Systemd 单元文件均使用 mktemp 原子替换，杜绝断电损坏
 # - 安全：部署 safe_remove_tree，防御卸载时空变量导致 rm -rf 越权删除系统根目录
@@ -142,12 +144,11 @@ reject_unsafe_env_value() {
     [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || err "${name} 不允许包含换行符"
 }
 
-shell_quote_env() {
+# 🚀 优化：符合 Systemd 环境文件规范的高能转义，保留原始 $ 符号，防止密码连接失败
+systemd_quote_env() {
     local value="$1"
     value=${value//\\/\\\\}
     value=${value//\"/\\\"}
-    value=${value//\$/\\$}
-    value=${value//\`/\\\`}
     printf '"%s"' "$value"
 }
 
@@ -235,7 +236,8 @@ get_local_sb_version() {
         "${BIN_DIR}/singbox" version 2>/dev/null | awk '/sing-box version/{print $3; exit}' || true
         return 0
     fi
-    return 1
+    echo ""
+    return 0 # 🚀 强固设计：首装未发现 singbox 时，返回 0 并输出空字串，彻底消灭 set -e 的熔断自尽！
 }
 
 get_sb_version() {
@@ -243,12 +245,13 @@ get_sb_version() {
     raw_json="$(curl --fail --silent --show-error --location --connect-timeout 4 --max-time 8 \
         -H 'Accept: application/vnd.github+json' -H 'User-Agent: nmu-tunnel-installer' \
         'https://api.github.com/repos/SagerNet/sing-box/releases/latest' 2>/dev/null || true)"
-    v="$(printf '%s\n' "$raw_json" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' | head -n1)"
+    v="$(printf '%s\n' "$raw_json" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' | head -n1 || true)"
     printf '%s\n' "$v"
+    return 0 # 🚀 防御网络查询超时返回状态 1 导致严格模式崩溃
 }
 
 create_env() {
-    say "同步核心二进制组件..."
+    say "同步环境依赖..."
     ensure_service_user
     install -d -m 0750 -o root -g "$SERVICE_USER" "$ETC_DIR" "$LIB_DIR" "$BIN_DIR" "$LOG_DIR"
 
@@ -293,17 +296,21 @@ create_env() {
     # --- SING-BOX 同步 ---
     local LOCAL_VER TARGET_VER
     LOCAL_VER=$(get_local_sb_version)
-    if [[ -n "$LOCAL_VER" ]]; then
-        TARGET_VER=$(get_sb_version)
-        [[ -z "$TARGET_VER" ]] && TARGET_VER="$LOCAL_VER"
-    else
-        say "正在向 GitHub 检索 Sing-box 最新发行版..."
-        TARGET_VER=$(get_sb_version)
-        [[ -z "$TARGET_VER" ]] && TARGET_VER="1.8.11"
-    fi
+    TARGET_VER=$(get_sb_version)
 
     local need_sb_update=true
-    if [[ -x "${BIN_DIR}/singbox" ]] && [[ "$LOCAL_VER" = "$TARGET_VER" ]]; then
+    # 🚀 自愈防坍塌设计：网络异常且本地有可用二进制时直接跳过，防止发生离线覆盖降级导致安装断档。
+    if [[ -z "$TARGET_VER" ]]; then
+        if [[ -x "${BIN_DIR}/singbox" && -n "$LOCAL_VER" ]]; then
+            need_sb_update=false
+            say "警告：无法连接 GitHub 获取最新版本信息，自动跳过升级，继续保留本地 v${LOCAL_VER} 运行。"
+        else
+            say "警告：网络连接失败且本地无组件，回落至预设安全版本 1.8.11..."
+            TARGET_VER="1.8.11"
+        fi
+    fi
+
+    if [ "$need_sb_update" = "true" ] && [[ -x "${BIN_DIR}/singbox" ]] && [[ "$LOCAL_VER" = "$TARGET_VER" ]]; then
         need_sb_update=false
         say "本地已存版本 v${LOCAL_VER} 匹配目标版本 v${TARGET_VER}，跳过下载。"
     fi
@@ -348,21 +355,33 @@ EOF
     mv -f -- "$tmp" "$sysctl_file"
     sysctl --system >/dev/null || say "警告：部分 sysctl 参数未被内核接受"
 
-    # 防火墙 UDP 放行
-    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "active"; then
+    # 防火墙 UDP 放行（🚀 语法重构：显式 if-else 消除 trap ERR 对 A && B || C 链中 grep 返回值 1 的越权信号劫持）
+    local ufw_active=false
+    if command -v ufw >/dev/null 2>&1; then
+        if ufw status 2>/dev/null | grep -q "active"; then
+            ufw_active=true
+        fi
+    fi
+    if [ "$ufw_active" = "true" ]; then
         ufw allow out 7844/udp >/dev/null 2>&1 && ok "UFW 已成功放行 UDP 7844 出站通道。"
     fi
-    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
-        firewall-cmd --permanent --direct --add-rule ipv4 filter OUTPUT 0 -p udp --dport 7844 -j ACCEPT >/dev/null 2>&1
-        firewall-cmd --permanent --direct --add-rule ipv6 filter OUTPUT 0 -p udp --dport 7844 -j ACCEPT >/dev/null 2>&1
-        firewall-cmd --reload >/dev/null 2>&1
+
+    local fw_active=false
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        if systemctl is-active --quiet firewalld >/dev/null 2>&1; then
+            fw_active=true
+        fi
+    fi
+    if [ "$fw_active" = "true" ]; then
+        firewall-cmd --permanent --direct --add-rule ipv4 filter OUTPUT 0 -p udp --dport 7844 -j ACCEPT >/dev/null 2>&1 || true
+        firewall-cmd --permanent --direct --add-rule ipv6 filter OUTPUT 0 -p udp --dport 7844 -j ACCEPT >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
         ok "Firewalld 已成功放行 UDP 7844 出站通道。"
     fi
 }
 
-# --- 4. 配置文件生成与安全并流算法 ---
 write_configs() {
-    say "配置写入中..."
+    say "写入配置"
     WS_PORT="${WS_PORT:-56908}"
     SB_PORT="${SB_PORT:-40001}"
     METRICS_PORT="${METRICS_PORT:-30000}"
@@ -422,11 +441,11 @@ write_configs() {
         printf 'WS_PORT=%s\n' "$WS_PORT"
         printf 'SB_PORT=%s\n' "$SB_PORT"
         printf 'METRICS_PORT=%s\n' "$METRICS_PORT"
-        printf 'TOKEN=%s\n' "$(shell_quote_env "$TOKEN")"
-        printf 'CF_TOKEN=%s\n' "$(shell_quote_env "$CF_TOKEN")"
-        printf 'SECRET=%s\n' "$(shell_quote_env "$SECRET")"
-        printf 'FALLBACK_PROXY=%s\n' "$(shell_quote_env "$FALLBACK_PROXY")"
-        printf 'EXTRA_DOMAINS=%s\n' "$(shell_quote_env "$EXTRA_DOMAINS")"
+        printf 'TOKEN=%s\n' "$(systemd_quote_env "$TOKEN")"
+        printf 'CF_TOKEN=%s\n' "$(systemd_quote_env "$CF_TOKEN")"
+        printf 'SECRET=%s\n' "$(systemd_quote_env "$SECRET")"
+        printf 'FALLBACK_PROXY=%s\n' "$(systemd_quote_env "$FALLBACK_PROXY")"
+        printf 'EXTRA_DOMAINS=%s\n' "$(systemd_quote_env "$EXTRA_DOMAINS")"
     } >"$env_tmp"
 
     local base_domains=("netflix.com" "chatgpt.com" "openai.com" "ip.sb")
