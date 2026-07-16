@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# NMU Tunnel V13.2 - 极盾 E2E 全局快捷导航版 (深度安全与生存性能加固版)
+# NMU Tunnel V13.4.2 - 极盾 E2E 全局快捷导航版 (深度安全与生存性能加固版)
 # - 优化：移除外部 tr 与 xargs 依赖，改用纯 Bash 参数展开实现零分叉字符净化 [3]
 # - 优化：配置环境读取逻辑支持正则捕获首等号切割，彻底防范 base64 或密钥含有等号 "=" 时的解析中断和数据损毁
 # - 优化：pkill 采用精确名称匹配机制，消除安装脚本自身在特定路径下运行时被误杀自尽的隐患
@@ -28,8 +28,16 @@ LOG_DIR="/var/log/${APP_NAME}"
 SB_SERVICE="nmu-singbox.service"
 XT_SERVICE="nmu-xtunnel.service"
 CF_SERVICE="nmu-cloudflared.service"
+STATE_FILE="${LIB_DIR}/install-state"
+TXN_FILE="${LIB_DIR}/update-transaction"
+STAGING_DIR="${LIB_DIR}/staging"
+METRICS_DIR="${LIB_DIR}/metrics"
+CREDENTIALS_DIR="${ETC_DIR}/credentials"
+CONFIG_SCHEMA="3"
+UNIT_SCHEMA="3"
+SCRIPT_VERSION="13.4.2"
 
-say() { echo -e "\033[0;34m[NMU-V13.2]\033[0m $*"; }
+say() { echo -e "\033[0;34m[NMU-V13.4.2]\033[0m $*"; }
 ok() { echo -e "\033[0;32m[OK]\033[0m $*"; }
 err() { echo -e "\033[0;31m[ERROR]\033[0m $*"; exit 1; }
 
@@ -189,14 +197,15 @@ EOF
 
 # --- 3. 进程原生切断器 & 动态版本探针 ---
 kill_process_native() {
-    # 👈 核心加固：同步加入带连字符的标准 "sing-box" 进程特征，防止残留套接字导致重启绑定失败
-    local proc_patterns=("cloudflared" "xtunnel" "sing-box" "singbox")
-    for pattern in "${proc_patterns[@]}"; do
-        pkill -9 -x "$pattern" >/dev/null 2>&1 || true
-        local pids
-        pids=$(pgrep -x "$pattern" 2>/dev/null || true)
-        if [[ -n "$pids" ]]; then
-            echo "$pids" | xargs -r kill -9 >/dev/null 2>&1 || true
+    # 优先只管理 NMU 自己的 systemd cgroup，避免误杀机器上的其他同名实例。
+    local service pid
+    for service in "$CF_SERVICE" "$XT_SERVICE" "$SB_SERVICE"; do
+        systemctl stop "$service" >/dev/null 2>&1 || true
+        pid="$(systemctl show -p MainPID --value "$service" 2>/dev/null || true)"
+        if [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]] && kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 1
+            kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
         fi
     done
 }
@@ -707,10 +716,20 @@ write_units() {
         [[ "$unit_secret" != "$unit_token" ]] || err "环境文件中的 TOKEN 与 SECRET 不能相同"
     fi
 
-    unit_token="${unit_token//%/%%}"; unit_token="${unit_token//\\/\\\\}"; unit_token="${unit_token//\"/\\\"}"
-    unit_secret="${unit_secret//%/%%}"; unit_secret="${unit_secret//\\/\\\\}"; unit_secret="${unit_secret//\"/\\\"}"
-    unit_fallback="${unit_fallback//%/%%}"; unit_fallback="${unit_fallback//\\/\\\\}"; unit_fallback="${unit_fallback//\"/\\\"}"
-    unit_cf_token="${unit_cf_token//%/%%}"; unit_cf_token="${unit_cf_token//\\/\\\\}"; unit_cf_token="${unit_cf_token//\"/\\\"}"
+    # 每个原始值只进入一次统一编码器，防止分字段重复处理造成 $$ 继续膨胀为 $$$。
+    # 编码顺序固定：反斜杠、双引号、字面量 $、systemd % specifier。
+    systemd_escape_exec_arg() {
+        local value="$1"
+        value="${value//\\/\\\\}"
+        value="${value//\"/\\\"}"
+        value="${value//\$/\$\$}"
+        value="${value//%/%%}"
+        printf '%s' "$value"
+    }
+    unit_token="$(systemd_escape_exec_arg "$unit_token")"
+    unit_secret="$(systemd_escape_exec_arg "$unit_secret")"
+    unit_fallback="$(systemd_escape_exec_arg "$unit_fallback")"
+    unit_cf_token="$(systemd_escape_exec_arg "$unit_cf_token")"
 
     # 非毁灭性单向拉起链：sing-box -> xtunnel -> cloudflared。
     # Wants + After 负责一键拉起；下游 StopWhenUnneeded 负责根服务真正停止后的遗留进程回收。
@@ -983,6 +1002,8 @@ run_install_interactive() {
     write_configs
     write_units
     start_all
+    write_install_state || true
+    cleanup_maintenance_files
 }
 
 stop_services_menu() {
@@ -1082,6 +1103,505 @@ append_split_domains_menu() {
     say "当前最新合并追加域名列表: $merged_extras"
 }
 
+
+# --- 8.0 长期维护基础设施：状态、事务、诊断与清理 ---
+ensure_lts_dirs() {
+    mkdir -p "$ETC_DIR" "$LIB_DIR" "$BIN_DIR" "$LOG_DIR" "$BACKUP_DIR" "$STAGING_DIR" "$METRICS_DIR" "$CREDENTIALS_DIR" 2>/dev/null || true
+    chmod 0750 "$ETC_DIR" "$LIB_DIR" "$BIN_DIR" "$LOG_DIR" "$BACKUP_DIR" "$STAGING_DIR" "$METRICS_DIR" "$CREDENTIALS_DIR" 2>/dev/null || true
+}
+
+write_install_state() {
+    ensure_lts_dirs
+    local tmp arch sbv cfv xtv
+    arch="$(get_arch 2>/dev/null || uname -m)"
+    sbv="$(get_local_sb_version 2>/dev/null || true)"
+    cfv="$(get_cloudflared_local_version 2>/dev/null || true)"
+    xtv="$("${BIN_DIR}/xtunnel" --version 2>/dev/null | head -n1 || true)"
+    tmp="$(mktemp "${LIB_DIR}/.install-state.XXXXXX")" || return 1
+    cat >"$tmp" <<EOF
+INSTALL_VERSION=${SCRIPT_VERSION}
+CONFIG_SCHEMA=${CONFIG_SCHEMA}
+UNIT_SCHEMA=${UNIT_SCHEMA}
+ARCH=${arch}
+XTUNNEL_VERSION=${xtv:-unknown}
+SINGBOX_VERSION=${sbv:-unknown}
+CLOUDFLARED_VERSION=${cfv:-unknown}
+UPDATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+    chmod 0640 "$tmp"; chown root:"$SERVICE_USER" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$STATE_FILE"
+}
+
+transaction_begin() {
+    local component="$1" backup="$2" candidate="$3" tmp
+    ensure_lts_dirs
+    tmp="$(mktemp "${LIB_DIR}/.update-transaction.XXXXXX")" || err "无法创建更新事务"
+    cat >"$tmp" <<EOF
+COMPONENT=${component}
+STATE=prepared
+BACKUP=${backup}
+CANDIDATE=${candidate}
+STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+    chmod 0600 "$tmp"; mv -f "$tmp" "$TXN_FILE"
+}
+
+transaction_state() {
+    local state="$1" tmp
+    [[ -f "$TXN_FILE" ]] || return 0
+    tmp="$(mktemp "${LIB_DIR}/.update-transaction.XXXXXX")" || return 1
+    awk -v state="$state" 'BEGIN{done=0} /^STATE=/{print "STATE=" state; done=1; next} {print} END{if(!done) print "STATE=" state}' "$TXN_FILE" >"$tmp"
+    chmod 0600 "$tmp"; mv -f "$tmp" "$TXN_FILE"
+}
+
+transaction_commit() {
+    transaction_state committed
+    rm -f -- "$TXN_FILE"
+    write_install_state || true
+}
+
+recover_interrupted_transaction() {
+    [[ -f "$TXN_FILE" ]] || return 0
+    local component state backup target service
+    component="$(awk -F= '$1=="COMPONENT"{print substr($0,index($0,"=")+1)}' "$TXN_FILE")"
+    state="$(awk -F= '$1=="STATE"{print substr($0,index($0,"=")+1)}' "$TXN_FILE")"
+    backup="$(awk -F= '$1=="BACKUP"{print substr($0,index($0,"=")+1)}' "$TXN_FILE")"
+    [[ "$state" == "committed" ]] && { rm -f "$TXN_FILE"; return 0; }
+    case "$component" in
+        xtunnel) target="${BIN_DIR}/xtunnel"; service="$XT_SERVICE" ;;
+        singbox) target="${BIN_DIR}/singbox"; service="$SB_SERVICE" ;;
+        cloudflared) target="${BIN_DIR}/cloudflared"; service="$CF_SERVICE" ;;
+        *) say "发现未知更新事务，保留 $TXN_FILE 供人工检查"; return 1 ;;
+    esac
+    say "检测到未完成的 ${component} 更新事务 (${state})，执行安全恢复..."
+    if [[ -f "$backup" ]]; then
+        systemctl stop "$service" >/dev/null 2>&1 || true
+        install -m 0755 -- "$backup" "${target}.recovery" || err "事务恢复失败"
+        chown root:"$SERVICE_USER" "${target}.recovery" 2>/dev/null || true
+        mv -f "${target}.recovery" "$target"
+        systemctl start "$service" >/dev/null 2>&1 || true
+    fi
+    rm -f -- "$TXN_FILE"
+}
+
+portable_mtime_epoch() {
+    local path="$1" value
+    value="$(stat -c %Y -- "$path" 2>/dev/null || true)"
+    if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+        value="$(stat -f %m -- "$path" 2>/dev/null || true)"
+    fi
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$value"
+}
+
+cleanup_older_than() {
+    local directory="$1" max_age="$2" mode="$3" entry mtime now
+    [[ -d "$directory" ]] || return 0
+    now="$(date +%s)"
+    for entry in "$directory"/* "$directory"/.[!.]* "$directory"/..?*; do
+        [[ -e "$entry" || -L "$entry" ]] || continue
+        mtime="$(portable_mtime_epoch "$entry" || true)"
+        [[ "$mtime" =~ ^[0-9]+$ ]] || continue
+        (( now - mtime > max_age )) || continue
+        case "$mode" in
+            tree) rm -rf -- "$entry" ;;
+            file) [[ -f "$entry" || -L "$entry" ]] && rm -f -- "$entry" ;;
+        esac
+    done
+}
+
+cleanup_maintenance_files() {
+    ensure_lts_dirs
+    # 完全不调用 find，兼容 BusyBox/Alpine。staging 清理目录树，metrics 只清理文件。
+    cleanup_older_than "$STAGING_DIR" 86400 tree
+    cleanup_older_than "$METRICS_DIR" 2592000 file
+}
+
+capture_runtime_baseline() {
+    local label="$1" out="${METRICS_DIR}/${label}-$(date -u +%Y%m%dT%H%M%SZ).txt"
+    ensure_lts_dirs
+    {
+        echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "script_version=$SCRIPT_VERSION"
+        systemctl is-active "$SB_SERVICE" "$XT_SERVICE" "$CF_SERVICE" 2>/dev/null || true
+        curl -fsS --connect-timeout 2 --max-time 4 http://127.0.0.1:56900/debug/status 2>/dev/null || true
+        free -m 2>/dev/null || true
+        df -h "$LIB_DIR" 2>/dev/null || true
+    } >"$out"
+    chmod 0640 "$out" 2>/dev/null || true
+}
+
+full_chain_health_check() {
+    local ws_port sb_port metrics_port status_body active_tunnels
+    ws_port="$(awk -F= '$1=="WS_PORT"{gsub(/^"|"$/,"",$2);print $2}' "$ETC_DIR/env" 2>/dev/null | tail -n1)"
+    sb_port="$(awk -F= '$1=="SB_PORT"{gsub(/^"|"$/,"",$2);print $2}' "$ETC_DIR/env" 2>/dev/null | tail -n1)"
+    metrics_port="$(awk -F= '$1=="METRICS_PORT"{gsub(/^"|"$/,"",$2);print $2}' "$ETC_DIR/env" 2>/dev/null | tail -n1)"
+    systemctl is-active --quiet "$SB_SERVICE" || return 1
+    systemctl is-active --quiet "$XT_SERVICE" || return 1
+    systemctl is-active --quiet "$CF_SERVICE" || return 1
+    [[ -z "$sb_port" ]] || wait_for_local_port "$sb_port" "Sing-box" >/dev/null 2>&1 || return 1
+    [[ -z "$ws_port" ]] || wait_for_local_port "$ws_port" "xtunnel" >/dev/null 2>&1 || return 1
+
+    # 强制检查诊断端点。任何请求失败、空响应、字段缺失或零活跃通道均判失败。
+    status_body="$(curl -fsS --connect-timeout 2 --max-time 4 http://127.0.0.1:56900/debug/status 2>/dev/null)" || return 1
+    [[ -n "$status_body" ]] || return 1
+    active_tunnels="$(printf '%s\n' "$status_body" | awk -F: '/^[[:space:]]*active_tunnels[[:space:]]*:/{gsub(/[[:space:]]/,"",$2); print $2; exit}')"
+    [[ "$active_tunnels" =~ ^[0-9]+$ ]] || return 1
+    (( active_tunnels >= 1 )) || return 1
+
+    [[ -z "$metrics_port" ]] || curl -fsS --connect-timeout 2 --max-time 4 "http://127.0.0.1:${metrics_port}/metrics" >/dev/null 2>&1 || return 1
+    return 0
+}
+
+doctor_menu() {
+    require_root
+    local failures=0 warnings=0
+    pass(){ printf '\033[0;32m[PASS]\033[0m %s\n' "$*"; }
+    warn_doctor(){ printf '\033[0;33m[WARN]\033[0m %s\n' "$*"; warnings=$((warnings+1)); }
+    fail_doctor(){ printf '\033[0;31m[FAIL]\033[0m %s\n' "$*"; failures=$((failures+1)); }
+    echo
+    [[ -d "$ETC_DIR" && -d "$BIN_DIR" ]] && pass "目录结构存在" || fail_doctor "目录结构不完整"
+    [[ -r "$ETC_DIR/env" ]] && pass "env 可读取" || fail_doctor "缺少 env"
+    [[ -r "$ETC_DIR/singbox.json" ]] && pass "Sing-box 配置存在" || fail_doctor "缺少 singbox.json"
+    for bin in xtunnel singbox cloudflared; do
+        [[ -x "$BIN_DIR/$bin" ]] && pass "$bin 可执行" || fail_doctor "$bin 不可执行"
+    done
+    [[ ! -x "$BIN_DIR/singbox" ]] || "$BIN_DIR/singbox" check -c "$ETC_DIR/singbox.json" >/dev/null 2>&1 && pass "Sing-box 配置校验通过" || fail_doctor "Sing-box 配置校验失败"
+    for svc in "$SB_SERVICE" "$XT_SERVICE" "$CF_SERVICE"; do
+        systemctl cat "$svc" >/dev/null 2>&1 && pass "$svc 单元存在" || fail_doctor "$svc 单元缺失"
+        systemctl is-active --quiet "$svc" && pass "$svc 正在运行" || warn_doctor "$svc 未运行"
+    done
+    local mode free_kb
+    mode="$(stat -c '%a' "$ETC_DIR/env" 2>/dev/null || echo unknown)"
+    [[ "$mode" == "640" || "$mode" == "600" ]] && pass "env 权限安全 ($mode)" || warn_doctor "env 权限建议为 0640 或 0600，当前 $mode"
+    free_kb="$(df -Pk "$LIB_DIR" 2>/dev/null | awk 'NR==2{print $4}')"
+    [[ "$free_kb" =~ ^[0-9]+$ && "$free_kb" -gt 262144 ]] && pass "可用磁盘空间充足" || warn_doctor "可用磁盘空间低于 256 MiB"
+    [[ -f "$TXN_FILE" ]] && warn_doctor "存在未完成更新事务" || pass "无残留更新事务"
+    full_chain_health_check && pass "三层链路健康检查通过" || warn_doctor "三层链路健康检查未完全通过"
+    echo "诊断完成：FAIL=$failures WARN=$warnings"
+    (( failures == 0 ))
+}
+
+start_existing_services() {
+    require_root
+    recover_interrupted_transaction || true
+    systemctl start "$SB_SERVICE" || err "Sing-box 启动失败"
+    systemctl start "$XT_SERVICE" || err "xtunnel 启动失败"
+    systemctl start "$CF_SERVICE" || err "Cloudflared 启动失败"
+    full_chain_health_check || say "警告：服务已启动，但完整链路健康检查未完全通过"
+    ok "现有服务已启动，未执行安装、下载或配置重写。"
+}
+
+restart_existing_services() {
+    require_root
+    systemctl restart "$SB_SERVICE" || err "Sing-box 重启失败"
+    systemctl restart "$XT_SERVICE" || err "xtunnel 重启失败"
+    systemctl restart "$CF_SERVICE" || err "Cloudflared 重启失败"
+    full_chain_health_check || say "警告：重启完成，但完整链路健康检查未完全通过"
+}
+
+migrate_config_schema() {
+    require_root
+    ensure_lts_dirs
+    # 当前 V13.4 不改变 JSON 结构，只登记 Schema。未来迁移必须逐级新增。
+    write_install_state || err "写入安装状态失败"
+    ok "配置 Schema 已登记为 ${CONFIG_SCHEMA}，现有配置内容未改写。"
+}
+
+# --- 8.1 原位核心更新模块（不重建 WARP / 配置 / Systemd） ---
+UPDATE_LOCK="/run/lock/nmu-tunnel-update.lock"
+BACKUP_DIR="${LIB_DIR}/backups"
+XT_RELEASE_BASE="https://github.com/nmu-glitch/my-tunnels/releases/download/v1.0.1"
+
+with_update_lock() {
+    mkdir -p /run/lock "$BACKUP_DIR" "$BIN_DIR" || err "无法创建更新目录"
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"$UPDATE_LOCK"
+        flock -n 9 || err "已有 NMU 更新任务正在运行"
+    fi
+}
+
+get_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        *) err "不支持的 CPU 架构: $(uname -m)" ;;
+    esac
+}
+
+check_elf_arch() {
+    local file_path="$1" arch="$2" desc
+    [[ -s "$file_path" ]] || return 1
+    desc="$(file -b "$file_path" 2>/dev/null || true)"
+    [[ "$desc" == *ELF* ]] || return 1
+    if [[ "$arch" == "amd64" ]]; then
+        [[ "$desc" == *x86-64* || "$desc" == *x86_64* ]]
+    else
+        [[ "$desc" == *aarch64* || "$desc" == *ARM\ aarch64* ]]
+    fi
+}
+
+backup_binary() {
+    local name="$1" path="$2" stamp="$3"
+    [[ -f "$path" ]] || return 0
+    cp -a -- "$path" "${BACKUP_DIR}/${name}.${stamp}" || err "备份 ${name} 失败"
+}
+
+list_binary_backups_newest() {
+    local name="$1" file
+    # 时间戳命名为 YYYYMMDDTHHMMSSZ，字典倒序即为新到旧。
+    # 使用 shell glob 与 POSIX sort，避免 GNU find -printf。
+    for file in "$BACKUP_DIR"/"${name}."*; do
+        [[ -f "$file" ]] && printf '%s\n' "$file"
+    done | LC_ALL=C sort -r
+}
+
+prune_binary_backups() {
+    local name="$1" old index=0
+    while IFS= read -r old; do
+        [[ -n "$old" ]] || continue
+        index=$((index + 1))
+        (( index <= 5 )) && continue
+        rm -f -- "$old"
+    done < <(list_binary_backups_newest "$name")
+}
+
+restore_binary_backup() {
+    local name="$1" target="$2" stamp="$3" backup="${BACKUP_DIR}/${name}.${stamp}"
+    [[ -f "$backup" ]] || return 1
+    install -m 0755 -- "$backup" "${target}.rollback" || return 1
+    chown root:"$SERVICE_USER" "${target}.rollback" || return 1
+    mv -f -- "${target}.rollback" "$target"
+}
+
+wait_service_healthy() {
+    local service="$1" max_wait="${2:-20}" waited=0
+    while (( waited < max_wait )); do
+        systemctl is-active --quiet "$service" && return 0
+        sleep 1
+        waited=$((waited + 1))
+    done
+    return 1
+}
+
+get_cloudflared_local_version() {
+    [[ -x "${BIN_DIR}/cloudflared" ]] || { echo ""; return 1; }
+    "${BIN_DIR}/cloudflared" --version 2>/dev/null \
+        | sed -nE 's/^cloudflared version ([^ ]+).*/\1/p' | head -n1
+}
+
+get_cloudflared_latest_version() {
+    local raw_json v
+    raw_json=$(curl -sL --connect-timeout 5 --max-time 15 \
+        -H "Accept: application/vnd.github+json" \
+        -H "User-Agent: nmu-tunnel-installer/13.3" \
+        https://api.github.com/repos/cloudflare/cloudflared/releases/latest 2>/dev/null || true)
+    v=$(printf '%s' "$raw_json" | grep -m1 '"tag_name":' \
+        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v?([^"]+)".*/\1/' || true)
+    [[ "$v" =~ ^[0-9]{4}\.[0-9]+\.[0-9]+$ ]] && echo "$v" || echo ""
+}
+
+check_core_updates_menu() {
+    require_root
+    local sb_local sb_latest cf_local cf_latest xt_local
+    sb_local="$(get_local_sb_version || true)"
+    sb_latest="$(get_sb_version || true)"
+    cf_local="$(get_cloudflared_local_version || true)"
+    cf_latest="$(get_cloudflared_latest_version || true)"
+    xt_local="$("${BIN_DIR}/xtunnel" --version 2>/dev/null | head -n1 || true)"
+    echo
+    say "核心版本检测结果"
+    printf '  xtunnel     : %s\n' "${xt_local:-已安装（核心未提供版本输出）}"
+    printf '  sing-box    : 本地 %s / 最新稳定 %s\n' "${sb_local:-未安装}" "${sb_latest:-检测失败}"
+    printf '  cloudflared : 本地 %s / 最新 %s\n' "${cf_local:-未安装}" "${cf_latest:-检测失败}"
+}
+
+update_xtunnel_core() {
+    require_root
+    with_update_lock
+    local arch tmp sum_tmp url expected actual stamp was_active=false
+    arch="$(get_arch)"
+    tmp="$(mktemp "${BIN_DIR}/.xtunnel.update.XXXXXX")" || err "无法创建 xtunnel 更新临时文件"
+    sum_tmp="$(mktemp "${BIN_DIR}/.xtunnel.update.sha256.XXXXXX")" || err "无法创建校验临时文件"
+    trap 'rm -f -- "$tmp" "$sum_tmp"' RETURN
+
+    if [[ -f "/tmp/xtunnel" ]]; then
+        install -m 0755 -- /tmp/xtunnel "$tmp" || err "导入 /tmp/xtunnel 失败"
+    elif [[ -f "/tmp/xtunnel-linux-${arch}" ]]; then
+        install -m 0755 -- "/tmp/xtunnel-linux-${arch}" "$tmp" || err "导入本地架构核心失败"
+    else
+        url="${XT_RELEASE_BASE}/xtunnel-linux-${arch}"
+        say "下载 xtunnel 核心，不重建其他环境..."
+        curl --fail --location --retry 3 --retry-all-errors --connect-timeout 8 --max-time 180 \
+            --proto '=https' --tlsv1.2 -H "User-Agent: nmu-tunnel-updater/13.3" \
+            "$url" -o "$tmp" || err "xtunnel 下载失败"
+        if curl --fail --silent --show-error --location --connect-timeout 5 --max-time 20 \
+            --proto '=https' --tlsv1.2 "${url}.sha256" -o "$sum_tmp"; then
+            expected="$(awk 'NR==1{print $1}' "$sum_tmp")"
+            actual="$(sha256sum "$tmp" | awk '{print $1}')"
+            [[ "$expected" =~ ^[0-9A-Fa-f]{64}$ && "${expected,,}" == "${actual,,}" ]] \
+                || err "xtunnel SHA-256 校验失败"
+        else
+            err "线上 xtunnel 更新缺少 .sha256，拒绝降低供应链校验强度。可上传 /tmp/xtunnel 与 /tmp/xtunnel.sha256 离线更新。"
+        fi
+    fi
+    if [[ -f /tmp/xtunnel || -f "/tmp/xtunnel-linux-${arch}" ]]; then
+        local local_sum_file="/tmp/xtunnel.sha256"
+        [[ -f "$local_sum_file" ]] || err "本地 xtunnel 更新必须同时提供 /tmp/xtunnel.sha256"
+        expected="$(awk 'NR==1{print $1}' "$local_sum_file")"
+        actual="$(sha256sum "$tmp" | awk '{print $1}')"
+        [[ "$expected" =~ ^[0-9A-Fa-f]{64}$ && "${expected,,}" == "${actual,,}" ]] || err "本地 xtunnel SHA-256 校验失败"
+    fi
+    check_elf_arch "$tmp" "$arch" || err "xtunnel ELF 或架构校验失败"
+    "${BIN_DIR}/xtunnel" --help >/dev/null 2>&1 || true
+    systemctl is-active --quiet "$XT_SERVICE" && was_active=true
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    backup_binary xtunnel "${BIN_DIR}/xtunnel" "$stamp"
+    transaction_begin xtunnel "${BACKUP_DIR}/xtunnel.${stamp}" "$tmp"
+    capture_runtime_baseline before-xtunnel
+    transaction_state stopped
+    systemctl stop "$XT_SERVICE" || true
+    install -m 0755 -- "$tmp" "${BIN_DIR}/xtunnel.new" || err "写入 xtunnel 新核心失败"
+    chown root:"$SERVICE_USER" "${BIN_DIR}/xtunnel.new"
+    mv -f -- "${BIN_DIR}/xtunnel.new" "${BIN_DIR}/xtunnel"
+    transaction_state replaced
+    restorecon "${BIN_DIR}/xtunnel" >/dev/null 2>&1 || true
+    systemctl start "$XT_SERVICE" || true
+    if ! wait_service_healthy "$XT_SERVICE" 25; then
+        say "新 xtunnel 启动失败，自动回滚..."
+        systemctl stop "$XT_SERVICE" || true
+        restore_binary_backup xtunnel "${BIN_DIR}/xtunnel" "$stamp" || err "xtunnel 自动回滚失败"
+        $was_active && systemctl start "$XT_SERVICE" || true
+        err "xtunnel 更新失败，已恢复旧核心"
+    fi
+    transaction_state verified
+    capture_runtime_baseline after-xtunnel
+    transaction_commit
+    prune_binary_backups xtunnel
+    ok "xtunnel 已原位更新，WARP、Sing-box、Cloudflared、env 和 Systemd 均未重建。"
+}
+
+update_singbox_core() {
+    require_root
+    with_update_lock
+    local arch local_ver target_ver tmp_dir archive candidate stamp was_active=false
+    arch="$(get_arch)"
+    local_ver="$(get_local_sb_version || true)"
+    target_ver="$(get_sb_version || true)"
+    [[ -n "$target_ver" ]] || err "无法获取 Sing-box 最新稳定版"
+    if [[ "$local_ver" == "$target_ver" ]]; then ok "Sing-box 已是最新稳定版 v${target_ver}"; return 0; fi
+    tmp_dir="$(mktemp -d /tmp/nmu-sb-update.XXXXXX)" || err "无法创建 Sing-box 临时目录"
+    archive="${tmp_dir}/sing-box.tar.gz"
+    trap 'rm -rf -- "$tmp_dir"' RETURN
+    say "Sing-box: ${local_ver:-未安装} -> ${target_ver}"
+    curl --fail --location --retry 3 --connect-timeout 8 --max-time 180 --proto '=https' --tlsv1.2 \
+        "https://github.com/SagerNet/sing-box/releases/download/v${target_ver}/sing-box-${target_ver}-linux-${arch}.tar.gz" \
+        -o "$archive" || err "Sing-box 下载失败"
+    tar -tzf "$archive" | grep -Fx "sing-box-${target_ver}-linux-${arch}/sing-box" >/dev/null \
+        || err "Sing-box 压缩包结构异常"
+    candidate="${tmp_dir}/singbox"
+    tar -xOzf "$archive" "sing-box-${target_ver}-linux-${arch}/sing-box" >"$candidate" || err "Sing-box 解压失败"
+    chmod 0755 "$candidate"
+    "$candidate" version >/dev/null 2>&1 || err "Sing-box 候选核心无法运行"
+    systemctl is-active --quiet "$SB_SERVICE" && was_active=true
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    backup_binary singbox "${BIN_DIR}/singbox" "$stamp"
+    transaction_begin singbox "${BACKUP_DIR}/singbox.${stamp}" "$candidate"
+    capture_runtime_baseline before-singbox
+    transaction_state stopped
+    systemctl stop "$SB_SERVICE" || true
+    install -m 0755 -- "$candidate" "${BIN_DIR}/singbox.new"
+    chown root:"$SERVICE_USER" "${BIN_DIR}/singbox.new"
+    mv -f -- "${BIN_DIR}/singbox.new" "${BIN_DIR}/singbox"
+    transaction_state replaced
+    if ! "${BIN_DIR}/singbox" check -c "${ETC_DIR}/singbox.json"; then
+        say "新 Sing-box 与现有配置不兼容，自动回滚..."
+        restore_binary_backup singbox "${BIN_DIR}/singbox" "$stamp" || err "Sing-box 回滚失败"
+        $was_active && systemctl start "$SB_SERVICE" || true
+        err "Sing-box 更新失败，配置未改动"
+    fi
+    $was_active && systemctl start "$SB_SERVICE" || true
+    if $was_active && ! wait_service_healthy "$SB_SERVICE" 20; then
+        restore_binary_backup singbox "${BIN_DIR}/singbox" "$stamp" || err "Sing-box 回滚失败"
+        systemctl start "$SB_SERVICE" || true
+        err "Sing-box 新版启动失败，已回滚"
+    fi
+    transaction_state verified
+    capture_runtime_baseline after-singbox
+    transaction_commit
+    prune_binary_backups singbox
+    ok "Sing-box 已更新至 v${target_ver}，现有 WARP 与分流配置保持不变。"
+}
+
+update_cloudflared_core() {
+    require_root
+    with_update_lock
+    local arch local_ver target_ver tmp stamp was_active=false
+    arch="$(get_arch)"
+    local_ver="$(get_cloudflared_local_version || true)"
+    target_ver="$(get_cloudflared_latest_version || true)"
+    [[ -n "$target_ver" ]] || err "无法获取 Cloudflared 最新版"
+    if [[ "$local_ver" == "$target_ver" ]]; then ok "Cloudflared 已是最新版 ${target_ver}"; return 0; fi
+    tmp="$(mktemp "${BIN_DIR}/.cloudflared.update.XXXXXX")" || err "无法创建 Cloudflared 临时文件"
+    trap 'rm -f -- "$tmp"' RETURN
+    say "Cloudflared: ${local_ver:-未安装} -> ${target_ver}"
+    curl --fail --location --retry 3 --connect-timeout 8 --max-time 180 --proto '=https' --tlsv1.2 \
+        "https://github.com/cloudflare/cloudflared/releases/download/${target_ver}/cloudflared-linux-${arch}" \
+        -o "$tmp" || err "Cloudflared 下载失败"
+    chmod 0755 "$tmp"
+    check_elf_arch "$tmp" "$arch" || err "Cloudflared ELF 或架构校验失败"
+    "$tmp" --version >/dev/null 2>&1 || err "Cloudflared 候选核心无法运行"
+    systemctl is-active --quiet "$CF_SERVICE" && was_active=true
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    backup_binary cloudflared "${BIN_DIR}/cloudflared" "$stamp"
+    transaction_begin cloudflared "${BACKUP_DIR}/cloudflared.${stamp}" "$tmp"
+    capture_runtime_baseline before-cloudflared
+    transaction_state stopped
+    systemctl stop "$CF_SERVICE" || true
+    install -m 0755 -- "$tmp" "${BIN_DIR}/cloudflared.new"
+    chown root:"$SERVICE_USER" "${BIN_DIR}/cloudflared.new"
+    mv -f -- "${BIN_DIR}/cloudflared.new" "${BIN_DIR}/cloudflared"
+    transaction_state replaced
+    $was_active && systemctl start "$CF_SERVICE" || true
+    if $was_active && ! wait_service_healthy "$CF_SERVICE" 25; then
+        restore_binary_backup cloudflared "${BIN_DIR}/cloudflared" "$stamp" || err "Cloudflared 回滚失败"
+        systemctl start "$CF_SERVICE" || true
+        err "Cloudflared 新版启动失败，已回滚"
+    fi
+    transaction_state verified
+    capture_runtime_baseline after-cloudflared
+    transaction_commit
+    prune_binary_backups cloudflared
+    ok "Cloudflared 已更新至 ${target_ver}，Tunnel Token 与现有配置保持不变。"
+}
+
+update_all_cores() {
+    update_xtunnel_core
+    update_singbox_core
+    update_cloudflared_core
+    ok "三个核心更新流程执行完毕。"
+}
+
+rollback_core_menu() {
+    require_root
+    local name target service latest
+    read -p "回滚组件 [xtunnel/singbox/cloudflared]: " name
+    case "$name" in
+        xtunnel) target="${BIN_DIR}/xtunnel"; service="$XT_SERVICE" ;;
+        singbox) target="${BIN_DIR}/singbox"; service="$SB_SERVICE" ;;
+        cloudflared) target="${BIN_DIR}/cloudflared"; service="$CF_SERVICE" ;;
+        *) err "不支持的组件" ;;
+    esac
+    latest="$(list_binary_backups_newest "$name" | sed -n '1p')"
+    [[ -n "$latest" && -f "$latest" ]] || err "没有找到 ${name} 备份"
+    systemctl stop "$service" || true
+    install -m 0755 -- "$latest" "${target}.rollback"
+    chown root:"$SERVICE_USER" "${target}.rollback"
+    mv -f -- "${target}.rollback" "$target"
+    systemctl start "$service" || err "回滚后服务启动失败"
+    ok "${name} 已回滚到 $(basename "$latest")"
+}
+
 # --- 9. 经典交互式 TTY 菜单 ---
 menu() {
     create_shortcut # 每次进入菜单时自动尝试注册/刷新 'nmu' 快捷指令
@@ -1089,18 +1609,28 @@ menu() {
     while true; do
         clear
         say "=================================================="
-        say "         NMU-Tunnel 极盾 E2E 导航版 (V13.2)        "
+        say "         NMU-Tunnel 极盾 E2E 导航版 (V13.4.2)        "
         say "  [提示] 终端任意路径输入 'nmu' 即可直接唤醒此菜单   "
         say "=================================================="
-        echo "  1. 启动并安装服务"
+        echo "  1. 首次安装 / 完整重建环境"
         echo "  2. 停止服务"
         echo "  3. 实时查看日志 (退出日志请按 Ctrl+C)"
         echo "  4. 完全物理卸载"
         echo "  5. 追加分流域名 (不破坏现有环境/即时生效)"
+        echo "  6. 检测 xtunnel / Sing-box / Cloudflared 版本"
+        echo "  7. 仅原位更新 xtunnel 核心"
+        echo "  8. 仅更新 Sing-box 最新稳定版"
+        echo "  9. 仅更新 Cloudflared 最新版"
+        echo " 10. 依次更新三个核心 (不重建环境)"
+        echo " 11. 回滚指定核心"
+        echo " 12. 启动现有服务（不重建）"
+        echo " 13. 重启现有服务（不重建）"
+        echo " 14. 系统与链路 Doctor 自检"
+        echo " 15. 登记/迁移配置 Schema"
         echo "  0. 退出"
         say "=================================================="
         local choice
-        read -p "选择操作 [0-5]: " choice
+        read -p "选择操作 [0-15]: " choice
         case "${choice:-1}" in
             1) 
                 run_install_interactive 
@@ -1127,6 +1657,16 @@ menu() {
                 echo
                 read -n 1 -s -r -p "按任意键返回主菜单..."
                 ;;
+            6) check_core_updates_menu; echo; read -n 1 -s -r -p "按任意键返回主菜单..." ;;
+            7) update_xtunnel_core; echo; read -n 1 -s -r -p "按任意键返回主菜单..." ;;
+            8) update_singbox_core; echo; read -n 1 -s -r -p "按任意键返回主菜单..." ;;
+            9) update_cloudflared_core; echo; read -n 1 -s -r -p "按任意键返回主菜单..." ;;
+            10) update_all_cores; echo; read -n 1 -s -r -p "按任意键返回主菜单..." ;;
+            11) rollback_core_menu; echo; read -n 1 -s -r -p "按任意键返回主菜单..." ;;
+            12) start_existing_services; echo; read -n 1 -s -r -p "按任意键返回主菜单..." ;;
+            13) restart_existing_services; echo; read -n 1 -s -r -p "按任意键返回主菜单..." ;;
+            14) doctor_menu || true; echo; read -n 1 -s -r -p "按任意键返回主菜单..." ;;
+            15) migrate_config_schema; echo; read -n 1 -s -r -p "按任意键返回主菜单..." ;;
             0) 
                 exit 0 
                 ;;
@@ -1139,6 +1679,8 @@ menu() {
 }
 
 # --- 运行入口 (自动识别无参数会话和有参数自动化流水线) ---
+recover_interrupted_transaction || true
+cleanup_maintenance_files || true
 if [[ $# -eq 0 ]]; then
     menu
 else
@@ -1159,6 +1701,16 @@ else
         logs)
             journalctl -u "$SB_SERVICE" -u "$XT_SERVICE" -u "$CF_SERVICE" -f
             ;;
+        check-updates) check_core_updates_menu ;;
+        update-xtunnel) update_xtunnel_core ;;
+        update-singbox) update_singbox_core ;;
+        update-cloudflared) update_cloudflared_core ;;
+        update-all) update_all_cores ;;
+        rollback-core) rollback_core_menu ;;
+        start) start_existing_services ;;
+        restart) restart_existing_services ;;
+        doctor) doctor_menu ;;
+        migrate) migrate_config_schema ;;
         uninstall)
             require_root
             systemctl disable --now "$CF_SERVICE" "$XT_SERVICE" "$SB_SERVICE" || true
@@ -1177,7 +1729,7 @@ else
             ok "环境已彻底物理清理。"
             ;;
         *)
-            echo "用法: $0 {install|stop|logs|uninstall} 或无参数运行进入经典交互菜单"
+            echo "用法: $0 {install|start|restart|stop|logs|doctor|migrate|check-updates|update-xtunnel|update-singbox|update-cloudflared|update-all|rollback-core|uninstall}"
             ;;
     esac
 fi
