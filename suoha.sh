@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# NMU Tunnel V13.4.2 - 极盾 E2E 全局快捷导航版 (深度安全与生存性能加固版)
+# NMU Tunnel V13.4.3 - 极盾 E2E 全局快捷导航版 (深度安全与生存性能加固版)
 # - 优化：移除外部 tr 与 xargs 依赖，改用纯 Bash 参数展开实现零分叉字符净化 [3]
 # - 优化：配置环境读取逻辑支持正则捕获首等号切割，彻底防范 base64 或密钥含有等号 "=" 时的解析中断和数据损毁
 # - 优化：pkill 采用精确名称匹配机制，消除安装脚本自身在特定路径下运行时被误杀自尽的隐患
@@ -35,9 +35,9 @@ METRICS_DIR="${LIB_DIR}/metrics"
 CREDENTIALS_DIR="${ETC_DIR}/credentials"
 CONFIG_SCHEMA="3"
 UNIT_SCHEMA="3"
-SCRIPT_VERSION="13.4.2"
+SCRIPT_VERSION="13.4.3"
 
-say() { echo -e "\033[0;34m[NMU-V13.4.2]\033[0m $*"; }
+say() { echo -e "\033[0;34m[NMU-V13.4.3]\033[0m $*"; }
 ok() { echo -e "\033[0;32m[OK]\033[0m $*"; }
 err() { echo -e "\033[0;31m[ERROR]\033[0m $*"; exit 1; }
 
@@ -307,17 +307,8 @@ create_env() {
             --proto '=https' --tlsv1.2 -H "User-Agent: nmu-tunnel-installer/13.2" \
             "$dl_url" -o "$xt_tmp" || err "xtunnel 下载失败，可上传到 /tmp/xtunnel 后重试"
 
-        # 若仓库同时发布 .sha256 旁车文件则强制校验；尚未发布时保持兼容并继续执行 ELF 校验。
-        xt_sum_tmp="$(mktemp "${BIN_DIR}/.xtunnel.sha256.XXXXXX")" || err "无法创建校验临时文件"
-        if curl --fail --silent --show-error --location --retry 2 --connect-timeout 5 --max-time 20 \
-            --proto '=https' --tlsv1.2 "${dl_url}.sha256" -o "$xt_sum_tmp"; then
-            local expected_sum actual_sum
-            expected_sum="$(awk 'NR==1 {print $1}' "$xt_sum_tmp")"
-            actual_sum="$(sha256sum "$xt_tmp" | awk '{print $1}')"
-            [[ "$expected_sum" =~ ^[0-9a-fA-F]{64}$ && "${expected_sum,,}" == "$actual_sum" ]] || err "xtunnel SHA-256 校验失败"
-        else
-            say "提示：Release 未提供 .sha256，已降级执行 ELF 与架构校验。"
-        fi
+        # 固定 v1.0.1 资产通过 GitHub Release API digest 校验，不请求不存在的 .sha256 旁车文件。
+        verify_pinned_xtunnel_asset "$xt_tmp" "xtunnel-linux-${ARCH}"
     fi
 
     [[ -s "$xt_tmp" ]] || err "xtunnel 文件为空"
@@ -1311,7 +1302,11 @@ migrate_config_schema() {
 # --- 8.1 原位核心更新模块（不重建 WARP / 配置 / Systemd） ---
 UPDATE_LOCK="/run/lock/nmu-tunnel-update.lock"
 BACKUP_DIR="${LIB_DIR}/backups"
-XT_RELEASE_BASE="https://github.com/nmu-glitch/my-tunnels/releases/download/v1.0.1"
+XT_RELEASE_OWNER="nmu-glitch"
+XT_RELEASE_REPO="my-tunnels"
+XT_RELEASE_TAG="v1.0.1"
+XT_RELEASE_BASE="https://github.com/${XT_RELEASE_OWNER}/${XT_RELEASE_REPO}/releases/download/${XT_RELEASE_TAG}"
+XT_TRUST_DIR="${ETC_DIR}/trusted-digests"
 
 with_update_lock() {
     mkdir -p /run/lock "$BACKUP_DIR" "$BIN_DIR" || err "无法创建更新目录"
@@ -1416,6 +1411,57 @@ check_core_updates_menu() {
     printf '  cloudflared : 本地 %s / 最新 %s\n' "${cf_local:-未安装}" "${cf_latest:-检测失败}"
 }
 
+github_release_asset_digest() {
+    local asset="$1" raw digest
+    raw="$(curl --fail --silent --show-error --location \
+        --proto '=https' --tlsv1.2 --connect-timeout 8 --max-time 30 \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'X-GitHub-Api-Version: 2022-11-28' \
+        -H 'User-Agent: nmu-tunnel-updater/13.4.3' \
+        "https://api.github.com/repos/${XT_RELEASE_OWNER}/${XT_RELEASE_REPO}/releases/tags/${XT_RELEASE_TAG}" 2>/dev/null)" || return 1
+    # 只取与目标资产同一对象中的 digest。GitHub 当前格式为 sha256:<64 hex>。
+    digest="$(printf '%s' "$raw" | tr '\n' ' ' | sed 's/}[[:space:]]*,[[:space:]]*{/}\n{/g' \
+        | grep -F '"name":"'"$asset"'"' | head -n1 \
+        | sed -nE 's/.*"digest"[[:space:]]*:[[:space:]]*"sha256:([0-9A-Fa-f]{64})".*/\1/p')"
+    [[ "$digest" =~ ^[0-9A-Fa-f]{64}$ ]] || return 1
+    printf '%s' "${digest,,}"
+}
+
+read_trusted_asset_digest() {
+    local asset="$1" file="${XT_TRUST_DIR}/${XT_RELEASE_TAG}-${asset}.sha256" digest
+    [[ -r "$file" ]] || return 1
+    digest="$(awk 'NR==1{print $1}' "$file")"
+    [[ "$digest" =~ ^[0-9A-Fa-f]{64}$ ]] || return 1
+    printf '%s' "${digest,,}"
+}
+
+write_trusted_asset_digest() {
+    local asset="$1" digest="$2" file tmp
+    install -d -m 0750 "$XT_TRUST_DIR" || return 1
+    file="${XT_TRUST_DIR}/${XT_RELEASE_TAG}-${asset}.sha256"
+    tmp="$(mktemp "${XT_TRUST_DIR}/.digest.XXXXXX")" || return 1
+    printf '%s  %s\n' "$digest" "$asset" >"$tmp"
+    chmod 0640 "$tmp"
+    chown root:"$SERVICE_USER" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$file"
+}
+
+verify_pinned_xtunnel_asset() {
+    local file="$1" asset="$2" actual expected source=""
+    actual="$(sha256sum "$file" | awk '{print $1}')"
+    expected="$(github_release_asset_digest "$asset" || true)"
+    if [[ -n "$expected" ]]; then
+        source="GitHub Release API digest"
+    else
+        expected="$(read_trusted_asset_digest "$asset" || true)"
+        [[ -n "$expected" ]] && source="本机受信摘要缓存"
+    fi
+    [[ -n "$expected" ]] || err "GitHub API 未返回资产 digest，且本机没有受信摘要。请先上传 /tmp/xtunnel 与 /tmp/xtunnel.sha256 进行一次离线信任导入。"
+    [[ "${actual,,}" == "${expected,,}" ]] || err "xtunnel SHA-256 校验失败：${source} 与下载文件不一致"
+    write_trusted_asset_digest "$asset" "$actual" || err "无法写入受信摘要缓存"
+    say "xtunnel SHA-256 校验通过（${source}）"
+}
+
 update_xtunnel_core() {
     require_root
     with_update_lock
@@ -1435,22 +1481,16 @@ update_xtunnel_core() {
         curl --fail --location --retry 3 --retry-all-errors --connect-timeout 8 --max-time 180 \
             --proto '=https' --tlsv1.2 -H "User-Agent: nmu-tunnel-updater/13.3" \
             "$url" -o "$tmp" || err "xtunnel 下载失败"
-        if curl --fail --silent --show-error --location --connect-timeout 5 --max-time 20 \
-            --proto '=https' --tlsv1.2 "${url}.sha256" -o "$sum_tmp"; then
-            expected="$(awk 'NR==1{print $1}' "$sum_tmp")"
-            actual="$(sha256sum "$tmp" | awk '{print $1}')"
-            [[ "$expected" =~ ^[0-9A-Fa-f]{64}$ && "${expected,,}" == "${actual,,}" ]] \
-                || err "xtunnel SHA-256 校验失败"
-        else
-            err "线上 xtunnel 更新缺少 .sha256，拒绝降低供应链校验强度。可上传 /tmp/xtunnel 与 /tmp/xtunnel.sha256 离线更新。"
-        fi
+        verify_pinned_xtunnel_asset "$tmp" "xtunnel-linux-${arch}"
     fi
     if [[ -f /tmp/xtunnel || -f "/tmp/xtunnel-linux-${arch}" ]]; then
         local local_sum_file="/tmp/xtunnel.sha256"
-        [[ -f "$local_sum_file" ]] || err "本地 xtunnel 更新必须同时提供 /tmp/xtunnel.sha256"
+        [[ -f "$local_sum_file" ]] || local_sum_file="/tmp/xtunnel-linux-${arch}.sha256"
+        [[ -f "$local_sum_file" ]] || err "本地 xtunnel 更新必须同时提供 /tmp/xtunnel.sha256 或对应架构的 .sha256"
         expected="$(awk 'NR==1{print $1}' "$local_sum_file")"
         actual="$(sha256sum "$tmp" | awk '{print $1}')"
         [[ "$expected" =~ ^[0-9A-Fa-f]{64}$ && "${expected,,}" == "${actual,,}" ]] || err "本地 xtunnel SHA-256 校验失败"
+        write_trusted_asset_digest "xtunnel-linux-${arch}" "${actual,,}" || err "无法缓存本地受信摘要"
     fi
     check_elf_arch "$tmp" "$arch" || err "xtunnel ELF 或架构校验失败"
     "${BIN_DIR}/xtunnel" --help >/dev/null 2>&1 || true
@@ -1609,7 +1649,7 @@ menu() {
     while true; do
         clear
         say "=================================================="
-        say "         NMU-Tunnel 极盾 E2E 导航版 (V13.4.2)        "
+        say "         NMU-Tunnel 极盾 E2E 导航版 (V13.4.3)        "
         say "  [提示] 终端任意路径输入 'nmu' 即可直接唤醒此菜单   "
         say "=================================================="
         echo "  1. 首次安装 / 完整重建环境"
