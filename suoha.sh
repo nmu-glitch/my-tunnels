@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# NMU Tunnel V13.4.4 - 极盾 E2E 全局快捷导航版 (深度安全与生存性能加固版)
+# NMU Tunnel V13.4.5 - 极盾 E2E 全局快捷导航版 (深度安全与生存性能加固版)
 # - 优化：移除外部 tr 与 xargs 依赖，改用纯 Bash 参数展开实现零分叉字符净化 [3]
 # - 优化：配置环境读取逻辑支持正则捕获首等号切割，彻底防范 base64 或密钥含有等号 "=" 时的解析中断和数据损毁
 # - 优化：pkill 采用精确名称匹配机制，消除安装脚本自身在特定路径下运行时被误杀自尽的隐患
@@ -35,9 +35,9 @@ METRICS_DIR="${LIB_DIR}/metrics"
 CREDENTIALS_DIR="${ETC_DIR}/credentials"
 CONFIG_SCHEMA="3"
 UNIT_SCHEMA="3"
-SCRIPT_VERSION="13.4.4"
+SCRIPT_VERSION="13.4.5"
 
-say() { echo -e "\033[0;34m[NMU-V13.4.4]\033[0m $*"; }
+say() { echo -e "\033[0;34m[NMU-V13.4.5]\033[0m $*"; }
 ok() { echo -e "\033[0;32m[OK]\033[0m $*"; }
 err() { echo -e "\033[0;31m[ERROR]\033[0m $*"; exit 1; }
 
@@ -1301,6 +1301,10 @@ migrate_config_schema() {
 
 # --- 8.1 原位核心更新模块（不重建 WARP / 配置 / Systemd） ---
 UPDATE_LOCK="/run/lock/nmu-tunnel-update.lock"
+UPDATE_LOCK_DIR="/run/lock/nmu-tunnel-update.lock.d"
+UPDATE_LOCK_HELD=0
+UPDATE_LOCK_OWNER_PID=""
+UPDATE_LOCK_OWNER_START=""
 BACKUP_DIR="${LIB_DIR}/backups"
 XT_RELEASE_OWNER="nmu-glitch"
 XT_RELEASE_REPO="my-tunnels"
@@ -1308,43 +1312,90 @@ XT_RELEASE_TAG="v1.0.1"
 XT_RELEASE_BASE="https://github.com/${XT_RELEASE_OWNER}/${XT_RELEASE_REPO}/releases/download/${XT_RELEASE_TAG}"
 XT_TRUST_DIR="${ETC_DIR}/trusted-digests"
 
-UPDATE_LOCK_HELD=0
+process_start_ticks() {
+    local pid="$1" stat rest
+    [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/stat" ]] || return 1
+    stat="$(cat "/proc/$pid/stat" 2>/dev/null)" || return 1
+    # comm 字段可能包含空格和括号，因此从最后一个 ") " 后再解析；starttime 是剩余字段第 20 项。
+    rest="${stat##*) }"
+    set -- $rest
+    [[ $# -ge 20 ]] || return 1
+    printf '%s' "$20"
+}
 
-with_update_lock() {
-    mkdir -p /run/lock "$BACKUP_DIR" "$BIN_DIR" || err "无法创建更新目录"
+update_lock_owner_alive() {
+    local pid="$1" expected_start="$2" actual_start
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    actual_start="$(process_start_ticks "$pid" 2>/dev/null || true)"
+    [[ -n "$actual_start" && -n "$expected_start" && "$actual_start" == "$expected_start" ]]
+}
 
-    # 同一菜单进程内的更新函数允许安全复用锁，避免选项 10 在第二个核心处自锁。
-    if [[ "$UPDATE_LOCK_HELD" -eq 1 ]]; then
-        return 0
-    fi
-
-    if command -v flock >/dev/null 2>&1; then
-        exec 9>"$UPDATE_LOCK"
-        # 允许另一个刚结束的更新任务有 8 秒清理窗口，减少瞬时误报。
-        if ! flock -w 8 9; then
-            local owner=""
-            owner="$(cat "$UPDATE_LOCK" 2>/dev/null || true)"
-            exec 9>&-
-            if [[ "$owner" =~ ^pid=([0-9]+) ]]; then
-                err "已有 NMU 更新任务正在运行（PID ${BASH_REMATCH[1]}）。如该 PID 已不存在，可删除 $UPDATE_LOCK 后重试。"
-            fi
-            err "已有 NMU 更新任务正在运行；等待 8 秒后锁仍未释放。"
-        fi
-        printf 'pid=%s started=%s command=%q\n' "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${1:-update}" >"$UPDATE_LOCK"
-        UPDATE_LOCK_HELD=1
-    else
-        # 没有 flock 时保持原脚本兼容性，但明确提示并发保护降级。
-        say "警告：系统缺少 flock，更新任务将以兼容模式运行。"
-    fi
+read_update_lock_owner() {
+    UPDATE_LOCK_OWNER_PID=""
+    UPDATE_LOCK_OWNER_START=""
+    [[ -r "$UPDATE_LOCK_DIR/owner" ]] || return 1
+    while IFS='=' read -r key value; do
+        case "$key" in
+            pid) UPDATE_LOCK_OWNER_PID="$value" ;;
+            start_ticks) UPDATE_LOCK_OWNER_START="$value" ;;
+        esac
+    done <"$UPDATE_LOCK_DIR/owner"
+    [[ -n "$UPDATE_LOCK_OWNER_PID" ]]
 }
 
 release_update_lock() {
-    if [[ "$UPDATE_LOCK_HELD" -eq 1 ]]; then
-        : >"$UPDATE_LOCK" 2>/dev/null || true
-        flock -u 9 2>/dev/null || true
-        exec 9>&-
-        UPDATE_LOCK_HELD=0
+    [[ "$UPDATE_LOCK_HELD" -eq 1 ]] || return 0
+    local owner_pid="" owner_start=""
+    if [[ -r "$UPDATE_LOCK_DIR/owner" ]]; then
+        owner_pid="$(awk -F= '$1=="pid"{print $2; exit}' "$UPDATE_LOCK_DIR/owner" 2>/dev/null || true)"
+        owner_start="$(awk -F= '$1=="start_ticks"{print $2; exit}' "$UPDATE_LOCK_DIR/owner" 2>/dev/null || true)"
     fi
+    # 只删除本进程创建的租约，绝不移除另一个真实更新任务的锁。
+    if [[ "$owner_pid" == "$$" && "$owner_start" == "$(process_start_ticks $$ 2>/dev/null || true)" ]]; then
+        rm -rf --one-file-system -- "$UPDATE_LOCK_DIR" 2>/dev/null || true
+        rm -f -- "$UPDATE_LOCK" 2>/dev/null || true
+    fi
+    UPDATE_LOCK_HELD=0
+}
+
+with_update_lock() {
+    mkdir -p /run/lock "$BACKUP_DIR" "$BIN_DIR" || err "无法创建更新目录"
+    [[ "$UPDATE_LOCK_HELD" -eq 1 ]] && return 0
+
+    local attempt owner_pid owner_start owner_cmd owner_since self_start
+    self_start="$(process_start_ticks $$ 2>/dev/null || true)"
+    [[ -n "$self_start" ]] || err "无法读取当前更新进程启动标识"
+
+    for attempt in 1 2 3 4 5 6 7 8 9; do
+        if mkdir -m 0700 "$UPDATE_LOCK_DIR" 2>/dev/null; then
+            {
+                printf 'pid=%s\n' "$$"
+                printf 'start_ticks=%s\n' "$self_start"
+                printf 'started=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                printf 'command=%s\n' "${1:-update}"
+            } >"$UPDATE_LOCK_DIR/owner"
+            chmod 0600 "$UPDATE_LOCK_DIR/owner"
+            printf 'pid=%s started=%s\n' "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$UPDATE_LOCK"
+            UPDATE_LOCK_HELD=1
+            return 0
+        fi
+
+        read_update_lock_owner || true
+        owner_pid="$UPDATE_LOCK_OWNER_PID"
+        owner_start="$UPDATE_LOCK_OWNER_START"
+        if ! update_lock_owner_alive "$owner_pid" "$owner_start"; then
+            say "检测到断网或异常退出留下的失效更新锁，正在自动清理..."
+            rm -rf --one-file-system -- "$UPDATE_LOCK_DIR" 2>/dev/null || true
+            rm -f -- "$UPDATE_LOCK" 2>/dev/null || true
+            continue
+        fi
+        [[ "$attempt" -lt 9 ]] && sleep 1
+    done
+
+    owner_cmd="$(awk -F= '$1=="command"{print substr($0,index($0,"=")+1); exit}' "$UPDATE_LOCK_DIR/owner" 2>/dev/null || true)"
+    owner_since="$(awk -F= '$1=="started"{print $2; exit}' "$UPDATE_LOCK_DIR/owner" 2>/dev/null || true)"
+    err "已有真实 NMU 更新任务正在运行（PID ${owner_pid:-未知}，开始于 ${owner_since:-未知}，任务 ${owner_cmd:-未知}）"
 }
 
 get_arch() {
@@ -1550,7 +1601,6 @@ update_xtunnel_core() {
     transaction_commit
     prune_binary_backups xtunnel
     ok "xtunnel 已原位更新，WARP、Sing-box、Cloudflared、env 和 Systemd 均未重建。"
-    release_update_lock
 }
 
 update_singbox_core() {
@@ -1561,11 +1611,7 @@ update_singbox_core() {
     local_ver="$(get_local_sb_version || true)"
     target_ver="$(get_sb_version || true)"
     [[ -n "$target_ver" ]] || err "无法获取 Sing-box 最新稳定版"
-    if [[ "$local_ver" == "$target_ver" ]]; then
-        ok "Sing-box 已是最新稳定版 v${target_ver}"
-        release_update_lock
-        return 0
-    fi
+    if [[ "$local_ver" == "$target_ver" ]]; then ok "Sing-box 已是最新稳定版 v${target_ver}"; return 0; fi
     tmp_dir="$(mktemp -d /tmp/nmu-sb-update.XXXXXX)" || err "无法创建 Sing-box 临时目录"
     archive="${tmp_dir}/sing-box.tar.gz"
     trap 'rm -rf -- "$tmp_dir"' RETURN
@@ -1607,7 +1653,6 @@ update_singbox_core() {
     transaction_commit
     prune_binary_backups singbox
     ok "Sing-box 已更新至 v${target_ver}，现有 WARP 与分流配置保持不变。"
-    release_update_lock
 }
 
 update_cloudflared_core() {
@@ -1618,11 +1663,7 @@ update_cloudflared_core() {
     local_ver="$(get_cloudflared_local_version || true)"
     target_ver="$(get_cloudflared_latest_version || true)"
     [[ -n "$target_ver" ]] || err "无法获取 Cloudflared 最新版"
-    if [[ "$local_ver" == "$target_ver" ]]; then
-        ok "Cloudflared 已是最新版 ${target_ver}"
-        release_update_lock
-        return 0
-    fi
+    if [[ "$local_ver" == "$target_ver" ]]; then ok "Cloudflared 已是最新版 ${target_ver}"; return 0; fi
     tmp="$(mktemp "${BIN_DIR}/.cloudflared.update.XXXXXX")" || err "无法创建 Cloudflared 临时文件"
     trap 'rm -f -- "$tmp"' RETURN
     say "Cloudflared: ${local_ver:-未安装} -> ${target_ver}"
@@ -1654,7 +1695,6 @@ update_cloudflared_core() {
     transaction_commit
     prune_binary_backups cloudflared
     ok "Cloudflared 已更新至 ${target_ver}，Tunnel Token 与现有配置保持不变。"
-    release_update_lock
 }
 
 update_all_cores() {
@@ -1691,7 +1731,7 @@ menu() {
     while true; do
         clear
         say "=================================================="
-        say "         NMU-Tunnel 极盾 E2E 导航版 (V13.4.3)        "
+        say "         NMU-Tunnel 极盾 E2E 导航版 (V13.4.5)        "
         say "  [提示] 终端任意路径输入 'nmu' 即可直接唤醒此菜单   "
         say "=================================================="
         echo "  1. 首次安装 / 完整重建环境"
@@ -1761,10 +1801,11 @@ menu() {
 }
 
 # --- 运行入口 (自动识别无参数会话和有参数自动化流水线) ---
-# 无论正常退出、Ctrl+C 还是错误退出，都释放本进程持有的更新锁。
+# 更新锁使用 PID + /proc starttime 租约，不会被 curl、systemctl、tar 等子进程继承。
+# 正常退出、错误退出、Ctrl+C、SSH 断开或 systemd 终止时均尝试释放本进程租约。
 trap 'release_update_lock' EXIT
 trap 'release_update_lock; exit 130' INT
-trap 'release_update_lock; exit 143' TERM
+trap 'release_update_lock; exit 143' TERM HUP
 
 recover_interrupted_transaction || true
 cleanup_maintenance_files || true
