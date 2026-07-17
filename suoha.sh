@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# NMU Tunnel V13.4.3 - 极盾 E2E 全局快捷导航版 (深度安全与生存性能加固版)
+# NMU Tunnel V13.4.4 - 极盾 E2E 全局快捷导航版 (深度安全与生存性能加固版)
 # - 优化：移除外部 tr 与 xargs 依赖，改用纯 Bash 参数展开实现零分叉字符净化 [3]
 # - 优化：配置环境读取逻辑支持正则捕获首等号切割，彻底防范 base64 或密钥含有等号 "=" 时的解析中断和数据损毁
 # - 优化：pkill 采用精确名称匹配机制，消除安装脚本自身在特定路径下运行时被误杀自尽的隐患
@@ -35,9 +35,9 @@ METRICS_DIR="${LIB_DIR}/metrics"
 CREDENTIALS_DIR="${ETC_DIR}/credentials"
 CONFIG_SCHEMA="3"
 UNIT_SCHEMA="3"
-SCRIPT_VERSION="13.4.3"
+SCRIPT_VERSION="13.4.4"
 
-say() { echo -e "\033[0;34m[NMU-V13.4.3]\033[0m $*"; }
+say() { echo -e "\033[0;34m[NMU-V13.4.4]\033[0m $*"; }
 ok() { echo -e "\033[0;32m[OK]\033[0m $*"; }
 err() { echo -e "\033[0;31m[ERROR]\033[0m $*"; exit 1; }
 
@@ -1308,11 +1308,42 @@ XT_RELEASE_TAG="v1.0.1"
 XT_RELEASE_BASE="https://github.com/${XT_RELEASE_OWNER}/${XT_RELEASE_REPO}/releases/download/${XT_RELEASE_TAG}"
 XT_TRUST_DIR="${ETC_DIR}/trusted-digests"
 
+UPDATE_LOCK_HELD=0
+
 with_update_lock() {
     mkdir -p /run/lock "$BACKUP_DIR" "$BIN_DIR" || err "无法创建更新目录"
+
+    # 同一菜单进程内的更新函数允许安全复用锁，避免选项 10 在第二个核心处自锁。
+    if [[ "$UPDATE_LOCK_HELD" -eq 1 ]]; then
+        return 0
+    fi
+
     if command -v flock >/dev/null 2>&1; then
         exec 9>"$UPDATE_LOCK"
-        flock -n 9 || err "已有 NMU 更新任务正在运行"
+        # 允许另一个刚结束的更新任务有 8 秒清理窗口，减少瞬时误报。
+        if ! flock -w 8 9; then
+            local owner=""
+            owner="$(cat "$UPDATE_LOCK" 2>/dev/null || true)"
+            exec 9>&-
+            if [[ "$owner" =~ ^pid=([0-9]+) ]]; then
+                err "已有 NMU 更新任务正在运行（PID ${BASH_REMATCH[1]}）。如该 PID 已不存在，可删除 $UPDATE_LOCK 后重试。"
+            fi
+            err "已有 NMU 更新任务正在运行；等待 8 秒后锁仍未释放。"
+        fi
+        printf 'pid=%s started=%s command=%q\n' "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${1:-update}" >"$UPDATE_LOCK"
+        UPDATE_LOCK_HELD=1
+    else
+        # 没有 flock 时保持原脚本兼容性，但明确提示并发保护降级。
+        say "警告：系统缺少 flock，更新任务将以兼容模式运行。"
+    fi
+}
+
+release_update_lock() {
+    if [[ "$UPDATE_LOCK_HELD" -eq 1 ]]; then
+        : >"$UPDATE_LOCK" 2>/dev/null || true
+        flock -u 9 2>/dev/null || true
+        exec 9>&-
+        UPDATE_LOCK_HELD=0
     fi
 }
 
@@ -1519,6 +1550,7 @@ update_xtunnel_core() {
     transaction_commit
     prune_binary_backups xtunnel
     ok "xtunnel 已原位更新，WARP、Sing-box、Cloudflared、env 和 Systemd 均未重建。"
+    release_update_lock
 }
 
 update_singbox_core() {
@@ -1529,7 +1561,11 @@ update_singbox_core() {
     local_ver="$(get_local_sb_version || true)"
     target_ver="$(get_sb_version || true)"
     [[ -n "$target_ver" ]] || err "无法获取 Sing-box 最新稳定版"
-    if [[ "$local_ver" == "$target_ver" ]]; then ok "Sing-box 已是最新稳定版 v${target_ver}"; return 0; fi
+    if [[ "$local_ver" == "$target_ver" ]]; then
+        ok "Sing-box 已是最新稳定版 v${target_ver}"
+        release_update_lock
+        return 0
+    fi
     tmp_dir="$(mktemp -d /tmp/nmu-sb-update.XXXXXX)" || err "无法创建 Sing-box 临时目录"
     archive="${tmp_dir}/sing-box.tar.gz"
     trap 'rm -rf -- "$tmp_dir"' RETURN
@@ -1571,6 +1607,7 @@ update_singbox_core() {
     transaction_commit
     prune_binary_backups singbox
     ok "Sing-box 已更新至 v${target_ver}，现有 WARP 与分流配置保持不变。"
+    release_update_lock
 }
 
 update_cloudflared_core() {
@@ -1581,7 +1618,11 @@ update_cloudflared_core() {
     local_ver="$(get_cloudflared_local_version || true)"
     target_ver="$(get_cloudflared_latest_version || true)"
     [[ -n "$target_ver" ]] || err "无法获取 Cloudflared 最新版"
-    if [[ "$local_ver" == "$target_ver" ]]; then ok "Cloudflared 已是最新版 ${target_ver}"; return 0; fi
+    if [[ "$local_ver" == "$target_ver" ]]; then
+        ok "Cloudflared 已是最新版 ${target_ver}"
+        release_update_lock
+        return 0
+    fi
     tmp="$(mktemp "${BIN_DIR}/.cloudflared.update.XXXXXX")" || err "无法创建 Cloudflared 临时文件"
     trap 'rm -f -- "$tmp"' RETURN
     say "Cloudflared: ${local_ver:-未安装} -> ${target_ver}"
@@ -1613,6 +1654,7 @@ update_cloudflared_core() {
     transaction_commit
     prune_binary_backups cloudflared
     ok "Cloudflared 已更新至 ${target_ver}，Tunnel Token 与现有配置保持不变。"
+    release_update_lock
 }
 
 update_all_cores() {
@@ -1719,6 +1761,11 @@ menu() {
 }
 
 # --- 运行入口 (自动识别无参数会话和有参数自动化流水线) ---
+# 无论正常退出、Ctrl+C 还是错误退出，都释放本进程持有的更新锁。
+trap 'release_update_lock' EXIT
+trap 'release_update_lock; exit 130' INT
+trap 'release_update_lock; exit 143' TERM
+
 recover_interrupted_transaction || true
 cleanup_maintenance_files || true
 if [[ $# -eq 0 ]]; then
