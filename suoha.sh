@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# NMU Tunnel V13.4.5 - 极盾 E2E 全局快捷导航版 (深度安全与生存性能加固版)
+# NMU Tunnel V14.0.0 - 极盾 E2E 全局快捷导航版 (深度安全与生存性能加固版)
 # - 优化：移除外部 tr 与 xargs 依赖，改用纯 Bash 参数展开实现零分叉字符净化 [3]
 # - 优化：配置环境读取逻辑支持正则捕获首等号切割，彻底防范 base64 或密钥含有等号 "=" 时的解析中断和数据损毁
 # - 优化：pkill 采用精确名称匹配机制，消除安装脚本自身在特定路径下运行时被误杀自尽的隐患
@@ -16,6 +16,9 @@
 # - 新增：追加分流规则时自动锁定内部端口与密钥，实现真正无感、不弹窗的热追加
 # - 新增：全局快捷命令 'nmu'，注册后在终端任意路径输入 nmu 即可秒开菜单
 # - 新增：菜单防退出循环，所有操作结束后按任意键优雅返回主菜单
+# - 新增：WS/H2/H3/Auto 服务端传输模式持久化、核心能力门控与在线切换
+# - 新增：Cloudflared 尾程固定 QUIC，VPS 到 Cloudflare 边缘强制 UDP 传输
+# - 修复：明确区分 Cloudflared QUIC 尾程与 xtunnel 应用层 H2/H3，防止伪 H3 配置
 # =========================================================
 
 APP_NAME="nmu-tunnel"
@@ -33,11 +36,11 @@ TXN_FILE="${LIB_DIR}/update-transaction"
 STAGING_DIR="${LIB_DIR}/staging"
 METRICS_DIR="${LIB_DIR}/metrics"
 CREDENTIALS_DIR="${ETC_DIR}/credentials"
-CONFIG_SCHEMA="3"
-UNIT_SCHEMA="3"
-SCRIPT_VERSION="13.4.5"
+CONFIG_SCHEMA="4"
+UNIT_SCHEMA="4"
+SCRIPT_VERSION="14.0.0"
 
-say() { echo -e "\033[0;34m[NMU-V13.4.5]\033[0m $*"; }
+say() { echo -e "\033[0;34m[NMU-V14.0.0]\033[0m $*"; }
 ok() { echo -e "\033[0;32m[OK]\033[0m $*"; }
 err() { echo -e "\033[0;31m[ERROR]\033[0m $*"; exit 1; }
 
@@ -461,6 +464,106 @@ optimize_network_for_quic() {
     ok "物理防火墙 QUIC 出站安全链配置完成。"
 }
 
+# --- 3.1 传输模式与 QUIC 尾程策略 ---
+# 说明：CLOUDFLARED_PROTOCOL=quic 强制的是 VPS cloudflared 到 Cloudflare 边缘这一段使用 UDP/QUIC。
+# xtunnel 的 ws/h2 是 Cloudflare/客户端到本机源站的应用层承载，两者不是同一个开关。
+normalize_transport_mode() {
+    local mode="${1:-auto}"
+    case "${mode,,}" in
+        ws|h1|websocket) printf '%s' "ws" ;;
+        h2|http2) printf '%s' "h2" ;;
+        h2-prefer|h2_prefer) printf '%s' "h2-prefer" ;;
+        h3|http3|quic) printf '%s' "h3" ;;
+        h3-prefer|h3_prefer) printf '%s' "h3-prefer" ;;
+        auto) printf '%s' "auto" ;;
+        *) return 1 ;;
+    esac
+}
+
+xtunnel_help_text() {
+    "${BIN_DIR}/xtunnel" -h 2>&1 || "${BIN_DIR}/xtunnel" --help 2>&1 || true
+}
+
+xtunnel_mode_supported() {
+    local mode="$1" help
+    help="$(xtunnel_help_text)"
+    case "$mode" in
+        ws) return 0 ;;
+        h2|h2-prefer)
+            grep -q -- '-transport' <<<"$help" && grep -Eq 'h2|transport-h2-experimental' <<<"$help"
+            ;;
+        h3|h3-prefer)
+            # 只有核心明确把 h3 暴露为生产 transport 值时才允许。
+            # 单独存在 -transport-h3-native 实验探针不代表可承载生产业务。
+            grep -q -- '-transport' <<<"$help" && grep -Eq 'h3-prefer|transport[^[:cntrl:]]*h3' <<<"$help"
+            ;;
+        auto) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+resolve_transport_mode() {
+    local requested normalized
+    requested="${1:-auto}"
+    normalized="$(normalize_transport_mode "$requested")" || err "不支持的传输模式: $requested"
+    if [[ "$normalized" == "auto" ]]; then
+        if xtunnel_mode_supported h3-prefer; then
+            printf '%s' "h3-prefer"
+        elif xtunnel_mode_supported h2-prefer; then
+            printf '%s' "h2-prefer"
+        else
+            printf '%s' "ws"
+        fi
+        return 0
+    fi
+    if xtunnel_mode_supported "$normalized"; then
+        printf '%s' "$normalized"
+        return 0
+    fi
+    err "当前 xtunnel 核心未声明支持传输模式 $normalized。请先更新核心，或改用 auto/ws。"
+}
+
+set_transport_mode() {
+    require_root
+    [[ -s "${ETC_DIR}/env" ]] || err "尚未安装或缺少 ${ETC_DIR}/env"
+    local requested="${1:-}" normalized tmp
+    if [[ -z "$requested" && -t 0 ]]; then
+        echo "可选模式: ws | h2-prefer | h2 | h3-prefer | h3 | auto"
+        read -r -p "请输入传输模式 [auto]: " requested
+    fi
+    normalized="$(normalize_transport_mode "${requested:-auto}")" || err "传输模式无效"
+    # h3 可预先写入配置，但重启前仍由 resolve_transport_mode 做核心能力门控。
+    tmp="$(mktemp "${ETC_DIR}/.env.transport.XXXXXX")" || err "无法创建临时配置"
+    awk -v mode="$normalized" '
+        BEGIN{done=0}
+        /^TRANSPORT_MODE=/{print "TRANSPORT_MODE=\"" mode "\""; done=1; next}
+        {print}
+        END{if(!done) print "TRANSPORT_MODE=\"" mode "\""}
+    ' "${ETC_DIR}/env" >"$tmp" || { rm -f "$tmp"; err "更新传输模式失败"; }
+    chmod 0640 "$tmp"; chown root:"$SERVICE_USER" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "${ETC_DIR}/env"
+    write_units
+    local effective
+    effective="$(resolve_transport_mode "$normalized")"
+    ok "传输模式已保存: 请求=$normalized，当前核心实际模式=$effective"
+    say "Cloudflared 尾程保持 --protocol quic，即 VPS 到 Cloudflare 边缘强制 UDP/QUIC。"
+    if systemctl is-active --quiet "$XT_SERVICE" || systemctl is-active --quiet "$CF_SERVICE"; then
+        systemctl restart "$XT_SERVICE" "$CF_SERVICE"
+        ok "xtunnel 与 cloudflared 已重启。"
+    fi
+}
+
+transport_status() {
+    local configured="auto" effective="unknown" cf_proto="quic"
+    if [[ -r "${ETC_DIR}/env" ]]; then
+        configured="$(awk -F= '$1=="TRANSPORT_MODE"{gsub(/^"|"$/,"",$2);print $2}' "${ETC_DIR}/env" | tail -n1)"
+        cf_proto="$(awk -F= '$1=="CLOUDFLARED_PROTOCOL"{gsub(/^"|"$/,"",$2);print $2}' "${ETC_DIR}/env" | tail -n1)"
+    fi
+    configured="${configured:-auto}"; cf_proto="${cf_proto:-quic}"
+    if [[ -x "${BIN_DIR}/xtunnel" ]]; then effective="$(resolve_transport_mode "$configured" 2>/dev/null || echo unsupported)"; fi
+    printf '配置传输模式: %s\n当前核心实际模式: %s\ncloudflared 尾程协议: %s (UDP)\n' "$configured" "$effective" "$cf_proto"
+}
+
 # --- 4. 配置文件生成与安全并流算法 ---
 write_configs() {
     say "配置写入中..."
@@ -469,8 +572,8 @@ write_configs() {
     # 自动化升级未传参数时继承现有值，防止 Token、Secret、端口和域名被空值覆盖。
     local token="${TOKEN-}" ws_port="${WS_PORT-}" cf_token="${CF_TOKEN-}"
     local extra_domains="${EXTRA_DOMAINS-}" secret="${SECRET-}"
-    local fallback_proxy="${FALLBACK_PROXY-}"
-    local env_token="" env_ws_port="" env_cf_token="" env_extra_domains="" env_secret="" env_fallback_proxy=""
+    local fallback_proxy="${FALLBACK_PROXY-}" transport_mode="${TRANSPORT_MODE-}"
+    local env_token="" env_ws_port="" env_cf_token="" env_extra_domains="" env_secret="" env_fallback_proxy="" env_transport_mode=""
     local sb_port="" m_port=""
     if [[ -f "${ETC_DIR}/env" ]]; then
         local line key value
@@ -488,6 +591,7 @@ write_configs() {
                     EXTRA_DOMAINS) env_extra_domains="$value" ;;
                     SECRET) env_secret="$value" ;;
                     FALLBACK_PROXY) env_fallback_proxy="$value" ;;
+                    TRANSPORT_MODE) env_transport_mode="$value" ;;
                     SB_PORT) sb_port="$value" ;;
                     METRICS_PORT) m_port="$value" ;;
                 esac
@@ -500,6 +604,8 @@ write_configs() {
     [[ -n "$extra_domains" ]] || extra_domains="$env_extra_domains"
     [[ -n "$secret" ]] || secret="$env_secret"
     [[ -n "$fallback_proxy" ]] || fallback_proxy="$env_fallback_proxy"
+    [[ -n "$transport_mode" ]] || transport_mode="$env_transport_mode"
+    transport_mode="${transport_mode:-auto}"
     fallback_proxy=${fallback_proxy:-https://www.debian.org}
 
     if [[ -z "$token" ]]; then
@@ -523,6 +629,13 @@ write_configs() {
             read -p "CF Tunnel Token (留空用临时域名): " cf_token
         fi
     fi
+
+    if [[ -z "$env_transport_mode" && -z "${TRANSPORT_MODE-}" && -t 0 ]]; then
+        echo "服务端传输模式: ws | h2-prefer | h2 | h3-prefer | h3 | auto"
+        read -r -p "选择传输模式 [auto]: " transport_mode
+        transport_mode="${transport_mode:-auto}"
+    fi
+    transport_mode="$(normalize_transport_mode "$transport_mode")" || err "TRANSPORT_MODE 无效"
 
     if [[ -z "$extra_domains" ]]; then
         if [ -t 0 ]; then
@@ -575,6 +688,8 @@ CF_TOKEN="${esc_cf_token}"
 EXTRA_DOMAINS="${esc_extra_domains}"
 SECRET="${esc_secret}"
 FALLBACK_PROXY="${esc_fallback_proxy}"
+TRANSPORT_MODE="${transport_mode}"
+CLOUDFLARED_PROTOCOL="quic"
 EOF
 
     # 基础分流，不侵扰原有链路
@@ -679,6 +794,7 @@ write_units() {
     # 显式初始化循环局部量：EOF补偿条件与空行过滤只能引用 unit_line，
     # 同时避免空文件在 set -u 下首次 read 失败时触发未绑定变量。
     local unit_cf_token="" unit_metrics_port="" unit_line="" unit_key="" unit_value=""
+    local unit_transport_mode="auto" unit_transport_effective="ws" unit_cf_protocol="quic"
     [[ -s "${ETC_DIR}/env" ]] || err "环境文件不存在或为空，拒绝生成空参数 Systemd 单元"
     while IFS= read -r unit_line || [[ -n "$unit_line" ]]; do
         [[ "$unit_line" =~ ^[[:space:]]*# ]] && continue
@@ -693,6 +809,8 @@ write_units() {
                 FALLBACK_PROXY) unit_fallback="$unit_value" ;; WS_PORT) unit_ws_port="$unit_value" ;;
                 SB_PORT) unit_sb_port="$unit_value" ;; CF_TOKEN) unit_cf_token="$unit_value" ;;
                 METRICS_PORT) unit_metrics_port="$unit_value" ;;
+                TRANSPORT_MODE) unit_transport_mode="$unit_value" ;;
+                CLOUDFLARED_PROTOCOL) unit_cf_protocol="$unit_value" ;;
             esac
         fi
     done < "${ETC_DIR}/env"
@@ -701,6 +819,10 @@ write_units() {
     [[ "$unit_sb_port" =~ ^[0-9]+$ ]] && (( unit_sb_port >= 1 && unit_sb_port <= 65535 )) || err "环境文件中的 SB_PORT 无效"
     [[ "$unit_metrics_port" =~ ^[0-9]+$ ]] && (( unit_metrics_port >= 1 && unit_metrics_port <= 65535 )) || err "环境文件中的 METRICS_PORT 无效"
     [[ -n "$unit_fallback" ]] || unit_fallback="https://www.debian.org"
+    [[ "$unit_cf_protocol" == "quic" ]] || err "CLOUDFLARED_PROTOCOL 必须为 quic；本最终版固定 VPS 尾程使用 UDP/QUIC"
+    unit_transport_mode="$(normalize_transport_mode "${unit_transport_mode:-auto}")" || err "环境文件中的 TRANSPORT_MODE 无效"
+    unit_transport_effective="$(resolve_transport_mode "$unit_transport_mode")" || err "当前核心无法启用 ${unit_transport_mode}"
+    say "应用层传输: 配置=${unit_transport_mode}，实际=${unit_transport_effective}；Cloudflared 尾程=quic/UDP"
     [[ "$unit_fallback" =~ ^https?://[^[:space:]]+$ ]] || err "环境文件中的 FALLBACK_PROXY 无效"
     if [[ -n "$unit_secret" ]]; then
         (( ${#unit_secret} >= 32 )) || err "环境文件中的 SECRET 少于 32 字节"
@@ -771,11 +893,11 @@ EOF
     # 未导出或仍保留旧值的调用方变量 SECRET。
     if [[ -n "$unit_secret" ]]; then
         cat >> "/etc/systemd/system/${XT_SERVICE}" <<EOF
-ExecStart=${BIN_DIR}/xtunnel -l ws://127.0.0.1:${unit_ws_port} -token "${unit_token}" -f socks5://127.0.0.1:${unit_sb_port} -secret "${unit_secret}" -fallback-proxy "${unit_fallback}" -quiet
+ExecStart=${BIN_DIR}/xtunnel -l ws://127.0.0.1:${unit_ws_port} -token "${unit_token}" -f socks5://127.0.0.1:${unit_sb_port} -secret "${unit_secret}" -fallback-proxy "${unit_fallback}" -transport ${unit_transport_effective} -quiet
 EOF
     else
         cat >> "/etc/systemd/system/${XT_SERVICE}" <<EOF
-ExecStart=${BIN_DIR}/xtunnel -l ws://127.0.0.1:${unit_ws_port} -token "${unit_token}" -f socks5://127.0.0.1:${unit_sb_port} -fallback-proxy "${unit_fallback}" -quiet
+ExecStart=${BIN_DIR}/xtunnel -l ws://127.0.0.1:${unit_ws_port} -token "${unit_token}" -f socks5://127.0.0.1:${unit_sb_port} -fallback-proxy "${unit_fallback}" -transport ${unit_transport_effective} -quiet
 EOF
     fi
     cat >> "/etc/systemd/system/${XT_SERVICE}" <<EOF
@@ -814,11 +936,11 @@ EOF
     # 导致固定 Tunnel 与临时域名模式判断错位。
     if [[ -n "$unit_cf_token" ]]; then
         cat >> "/etc/systemd/system/${CF_SERVICE}" <<EOF
-ExecStart=${BIN_DIR}/cloudflared --protocol quic tunnel run --token "${unit_cf_token}"
+ExecStart=${BIN_DIR}/cloudflared --protocol ${unit_cf_protocol} tunnel run --token "${unit_cf_token}"
 EOF
     else
         cat >> "/etc/systemd/system/${CF_SERVICE}" <<EOF
-ExecStart=${BIN_DIR}/cloudflared --protocol quic tunnel --url http://127.0.0.1:${unit_ws_port} --metrics 127.0.0.1:${unit_metrics_port}
+ExecStart=${BIN_DIR}/cloudflared --protocol ${unit_cf_protocol} tunnel --url http://127.0.0.1:${unit_ws_port} --metrics 127.0.0.1:${unit_metrics_port}
 EOF
     fi
     cat >> "/etc/systemd/system/${CF_SERVICE}" <<EOF
@@ -1731,7 +1853,7 @@ menu() {
     while true; do
         clear
         say "=================================================="
-        say "         NMU-Tunnel 极盾 E2E 导航版 (V13.4.5)        "
+        say "         NMU-Tunnel 极盾 E2E 导航版 (V14.0.0)        "
         say "  [提示] 终端任意路径输入 'nmu' 即可直接唤醒此菜单   "
         say "=================================================="
         echo "  1. 首次安装 / 完整重建环境"
@@ -1749,10 +1871,12 @@ menu() {
         echo " 13. 重启现有服务（不重建）"
         echo " 14. 系统与链路 Doctor 自检"
         echo " 15. 登记/迁移配置 Schema"
+        echo " 16. 设置 WS/H2/H3/Auto 传输模式"
+        echo " 17. 查看传输与 QUIC 尾程状态"
         echo "  0. 退出"
         say "=================================================="
         local choice
-        read -p "选择操作 [0-15]: " choice
+        read -p "选择操作 [0-17]: " choice
         case "${choice:-1}" in
             1) 
                 run_install_interactive 
@@ -1789,6 +1913,8 @@ menu() {
             13) restart_existing_services; echo; read -n 1 -s -r -p "按任意键返回主菜单..." ;;
             14) doctor_menu || true; echo; read -n 1 -s -r -p "按任意键返回主菜单..." ;;
             15) migrate_config_schema; echo; read -n 1 -s -r -p "按任意键返回主菜单..." ;;
+            16) set_transport_mode; echo; read -n 1 -s -r -p "按任意键返回主菜单..." ;;
+            17) transport_status; echo; read -n 1 -s -r -p "按任意键返回主菜单..." ;;
             0) 
                 exit 0 
                 ;;
@@ -1839,6 +1965,8 @@ else
         restart) restart_existing_services ;;
         doctor) doctor_menu ;;
         migrate) migrate_config_schema ;;
+        set-transport) set_transport_mode "${2:-auto}" ;;
+        transport-status) transport_status ;;
         uninstall)
             require_root
             systemctl disable --now "$CF_SERVICE" "$XT_SERVICE" "$SB_SERVICE" || true
@@ -1857,7 +1985,7 @@ else
             ok "环境已彻底物理清理。"
             ;;
         *)
-            echo "用法: $0 {install|start|restart|stop|logs|doctor|migrate|check-updates|update-xtunnel|update-singbox|update-cloudflared|update-all|rollback-core|uninstall}"
+            echo "用法: $0 {install|start|restart|stop|logs|doctor|migrate|set-transport|transport-status|check-updates|update-xtunnel|update-singbox|update-cloudflared|update-all|rollback-core|uninstall}"
             ;;
     esac
 fi
