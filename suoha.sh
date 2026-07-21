@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# NMU Tunnel V14.0.0 - 极盾 E2E 全局快捷导航版 (深度安全与生存性能加固版)
+# NMU Tunnel V14.1.0 - 极盾 E2E 全局快捷导航版 (深度安全与生存性能加固版)
 # - 优化：移除外部 tr 与 xargs 依赖，改用纯 Bash 参数展开实现零分叉字符净化 [3]
 # - 优化：配置环境读取逻辑支持正则捕获首等号切割，彻底防范 base64 或密钥含有等号 "=" 时的解析中断和数据损毁
 # - 优化：pkill 采用精确名称匹配机制，消除安装脚本自身在特定路径下运行时被误杀自尽的隐患
@@ -19,6 +19,9 @@
 # - 新增：WS/H2/H3/Auto 服务端传输模式持久化、核心能力门控与在线切换
 # - 新增：Cloudflared 尾程固定 QUIC，VPS 到 Cloudflare 边缘强制 UDP 传输
 # - 修复：明确区分 Cloudflared QUIC 尾程与 xtunnel 应用层 H2/H3，防止伪 H3 配置
+# - V14.1：Auto 改为服务端多协议接纳，不再在启动时永久锁死为单一 h2-prefer/ws
+# - V14.1：源站监听统一升级为 WSS/TLS，配合 Cloudflare http2Origin=true 与 noTLSVerify=true
+# - V14.1：旧核心不识别 auto 时自动传 ws 兼容值，但继续检测并展示服务端 WS/H2/H3 接纳能力
 # =========================================================
 
 APP_NAME="nmu-tunnel"
@@ -38,9 +41,9 @@ METRICS_DIR="${LIB_DIR}/metrics"
 CREDENTIALS_DIR="${ETC_DIR}/credentials"
 CONFIG_SCHEMA="4"
 UNIT_SCHEMA="4"
-SCRIPT_VERSION="14.0.0"
+SCRIPT_VERSION="14.1.0"
 
-say() { echo -e "\033[0;34m[NMU-V14.0.0]\033[0m $*"; }
+say() { echo -e "\033[0;34m[NMU-V14.1.0]\033[0m $*"; }
 ok() { echo -e "\033[0;32m[OK]\033[0m $*"; }
 err() { echo -e "\033[0;31m[ERROR]\033[0m $*"; exit 1; }
 
@@ -502,6 +505,35 @@ xtunnel_mode_supported() {
     esac
 }
 
+# 服务端 auto 与客户端“优选模式”不同：服务端不主动挑选唯一协议，而是在同一 TLS
+# 入口并行接纳核心已实现的 WS/H2/H3。-transport 仅作为核心内部兼容偏好；旧核心
+# 不认识 auto 时传 ws，仍不影响新版核心独立开放 H2/H3 服务端入口。
+server_auto_admission_summary() {
+    local modes="ws"
+    xtunnel_mode_supported h2-prefer && modes="${modes},h2" || true
+    xtunnel_mode_supported h3-prefer && modes="${modes},h3" || true
+    printf '%s' "$modes"
+}
+
+resolve_server_transport_mode() {
+    local requested normalized
+    requested="${1:-auto}"
+    normalized="$(normalize_transport_mode "$requested")" || return 1
+    if [[ "$normalized" == "auto" ]]; then
+        # 若核心原生声明 auto，直接交给核心；否则使用最安全的 ws 兼容值。
+        # 新版 NMU 核心的服务端 WS/H2/H3 admission 与此偏好解耦。
+        local help
+        help="$(xtunnel_help_text)"
+        if grep -q -- '-transport' <<<"$help" && grep -Eq '(^|[ ,|])auto([ ,|]|$)' <<<"$help"; then
+            printf '%s' "auto"
+        else
+            printf '%s' "ws"
+        fi
+        return 0
+    fi
+    resolve_transport_mode "$normalized"
+}
+
 resolve_transport_mode() {
     local requested normalized
     requested="${1:-auto}"
@@ -544,8 +576,12 @@ set_transport_mode() {
     mv -f "$tmp" "${ETC_DIR}/env"
     write_units
     local effective
-    effective="$(resolve_transport_mode "$normalized")"
-    ok "传输模式已保存: 请求=$normalized，当前核心实际模式=$effective"
+    effective="$(resolve_server_transport_mode "$normalized")"
+    if [[ "$normalized" == "auto" ]]; then
+        ok "Auto 已保存：服务端将按请求自动接纳 $(server_auto_admission_summary)，兼容启动参数=$effective"
+    else
+        ok "传输模式已保存: 请求=$normalized，启动参数=$effective"
+    fi
     say "Cloudflared 尾程保持 --protocol quic，即 VPS 到 Cloudflare 边缘强制 UDP/QUIC。"
     if systemctl is-active --quiet "$XT_SERVICE" || systemctl is-active --quiet "$CF_SERVICE"; then
         systemctl restart "$XT_SERVICE" "$CF_SERVICE"
@@ -560,8 +596,8 @@ transport_status() {
         cf_proto="$(awk -F= '$1=="CLOUDFLARED_PROTOCOL"{gsub(/^"|"$/,"",$2);print $2}' "${ETC_DIR}/env" | tail -n1)"
     fi
     configured="${configured:-auto}"; cf_proto="${cf_proto:-quic}"
-    if [[ -x "${BIN_DIR}/xtunnel" ]]; then effective="$(resolve_transport_mode "$configured" 2>/dev/null || echo unsupported)"; fi
-    printf '配置传输模式: %s\n当前核心实际模式: %s\ncloudflared 尾程协议: %s (UDP)\n' "$configured" "$effective" "$cf_proto"
+    if [[ -x "${BIN_DIR}/xtunnel" ]]; then effective="$(resolve_server_transport_mode "$configured" 2>/dev/null || echo unsupported)"; fi
+    printf '配置传输模式: %s\n服务端启动参数: %s\n服务端自动接纳: %s\ncloudflared 尾程协议: %s (UDP)\n' "$configured" "$effective" "$(server_auto_admission_summary)" "$cf_proto"
 }
 
 # --- 4. 配置文件生成与安全并流算法 ---
@@ -821,8 +857,14 @@ write_units() {
     [[ -n "$unit_fallback" ]] || unit_fallback="https://www.debian.org"
     [[ "$unit_cf_protocol" == "quic" ]] || err "CLOUDFLARED_PROTOCOL 必须为 quic；本最终版固定 VPS 尾程使用 UDP/QUIC"
     unit_transport_mode="$(normalize_transport_mode "${unit_transport_mode:-auto}")" || err "环境文件中的 TRANSPORT_MODE 无效"
-    unit_transport_effective="$(resolve_transport_mode "$unit_transport_mode")" || err "当前核心无法启用 ${unit_transport_mode}"
-    say "应用层传输: 配置=${unit_transport_mode}，实际=${unit_transport_effective}；Cloudflared 尾程=quic/UDP"
+    unit_transport_effective="$(resolve_server_transport_mode "$unit_transport_mode")" || err "当前核心无法启用 ${unit_transport_mode}"
+    local unit_admission_modes
+    unit_admission_modes="$(server_auto_admission_summary)"
+    if [[ "$unit_transport_mode" == "auto" ]]; then
+        say "服务端自动接纳: ${unit_admission_modes}；兼容启动参数=${unit_transport_effective}；Cloudflared 尾程=quic/UDP"
+    else
+        say "应用层传输: 配置=${unit_transport_mode}，启动参数=${unit_transport_effective}；服务端可接纳=${unit_admission_modes}"
+    fi
     [[ "$unit_fallback" =~ ^https?://[^[:space:]]+$ ]] || err "环境文件中的 FALLBACK_PROXY 无效"
     if [[ -n "$unit_secret" ]]; then
         (( ${#unit_secret} >= 32 )) || err "环境文件中的 SECRET 少于 32 字节"
@@ -893,11 +935,11 @@ EOF
     # 未导出或仍保留旧值的调用方变量 SECRET。
     if [[ -n "$unit_secret" ]]; then
         cat >> "/etc/systemd/system/${XT_SERVICE}" <<EOF
-ExecStart=${BIN_DIR}/xtunnel -l ws://127.0.0.1:${unit_ws_port} -token "${unit_token}" -f socks5://127.0.0.1:${unit_sb_port} -secret "${unit_secret}" -fallback-proxy "${unit_fallback}" -transport ${unit_transport_effective} -quiet
+ExecStart=${BIN_DIR}/xtunnel -l wss://127.0.0.1:${unit_ws_port} -token "${unit_token}" -f socks5://127.0.0.1:${unit_sb_port} -secret "${unit_secret}" -fallback-proxy "${unit_fallback}" -transport ${unit_transport_effective} -quiet
 EOF
     else
         cat >> "/etc/systemd/system/${XT_SERVICE}" <<EOF
-ExecStart=${BIN_DIR}/xtunnel -l ws://127.0.0.1:${unit_ws_port} -token "${unit_token}" -f socks5://127.0.0.1:${unit_sb_port} -fallback-proxy "${unit_fallback}" -transport ${unit_transport_effective} -quiet
+ExecStart=${BIN_DIR}/xtunnel -l wss://127.0.0.1:${unit_ws_port} -token "${unit_token}" -f socks5://127.0.0.1:${unit_sb_port} -fallback-proxy "${unit_fallback}" -transport ${unit_transport_effective} -quiet
 EOF
     fi
     cat >> "/etc/systemd/system/${XT_SERVICE}" <<EOF
