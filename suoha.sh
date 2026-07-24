@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# NMU Tunnel V14.1.0 - 极盾 E2E 全局快捷导航版 (深度安全与生存性能加固版)
+# NMU Tunnel V14.1.1 - 极盾 E2E 全局快捷导航版 (深度安全与生存性能加固版)
 # - 优化：移除外部 tr 与 xargs 依赖，改用纯 Bash 参数展开实现零分叉字符净化 [3]
 # - 优化：配置环境读取逻辑支持正则捕获首等号切割，彻底防范 base64 或密钥含有等号 "=" 时的解析中断和数据损毁
 # - 优化：pkill 采用精确名称匹配机制，消除安装脚本自身在特定路径下运行时被误杀自尽的隐患
@@ -41,9 +41,9 @@ METRICS_DIR="${LIB_DIR}/metrics"
 CREDENTIALS_DIR="${ETC_DIR}/credentials"
 CONFIG_SCHEMA="4"
 UNIT_SCHEMA="4"
-SCRIPT_VERSION="14.1.0"
+SCRIPT_VERSION="14.1.1"
 
-say() { echo -e "\033[0;34m[NMU-V14.1.0]\033[0m $*"; }
+say() { echo -e "\033[0;34m[NMU-V14.1.1]\033[0m $*"; }
 ok() { echo -e "\033[0;32m[OK]\033[0m $*"; }
 err() { echo -e "\033[0;31m[ERROR]\033[0m $*"; exit 1; }
 
@@ -487,18 +487,26 @@ xtunnel_help_text() {
     "${BIN_DIR}/xtunnel" -h 2>&1 || "${BIN_DIR}/xtunnel" --help 2>&1 || true
 }
 
+# 只接受独立的通用 -transport 参数。-transport-h2-experimental、
+# -transport-h3-native 和 -transport-datagram 不能被误判为 -transport。
+xtunnel_generic_transport_supported() {
+    local help="${1:-}"
+    [[ -n "$help" ]] || help="$(xtunnel_help_text)"
+    grep -Eq '^[[:space:]]*-transport([[:space:]]|$)' <<<"$help"
+}
+
 xtunnel_mode_supported() {
     local mode="$1" help
     help="$(xtunnel_help_text)"
     case "$mode" in
         ws) return 0 ;;
         h2|h2-prefer)
-            grep -q -- '-transport' <<<"$help" && grep -Eq 'h2|transport-h2-experimental' <<<"$help"
+            xtunnel_generic_transport_supported "$help" && grep -Eq '(^|[ ,|])h2(-prefer)?([ ,|]|$)' <<<"$help"
             ;;
         h3|h3-prefer)
             # 只有核心明确把 h3 暴露为生产 transport 值时才允许。
             # 单独存在 -transport-h3-native 实验探针不代表可承载生产业务。
-            grep -q -- '-transport' <<<"$help" && grep -Eq 'h3-prefer|transport[^[:cntrl:]]*h3' <<<"$help"
+            xtunnel_generic_transport_supported "$help" && grep -Eq '(^|[ ,|])h3(-prefer)?([ ,|]|$)' <<<"$help"
             ;;
         auto) return 0 ;;
         *) return 1 ;;
@@ -524,7 +532,7 @@ resolve_server_transport_mode() {
         # 新版 NMU 核心的服务端 WS/H2/H3 admission 与此偏好解耦。
         local help
         help="$(xtunnel_help_text)"
-        if grep -q -- '-transport' <<<"$help" && grep -Eq '(^|[ ,|])auto([ ,|]|$)' <<<"$help"; then
+        if xtunnel_generic_transport_supported "$help" && grep -Eq '(^|[ ,|])auto([ ,|]|$)' <<<"$help"; then
             printf '%s' "auto"
         else
             printf '%s' "ws"
@@ -830,7 +838,7 @@ write_units() {
     # 显式初始化循环局部量：EOF补偿条件与空行过滤只能引用 unit_line，
     # 同时避免空文件在 set -u 下首次 read 失败时触发未绑定变量。
     local unit_cf_token="" unit_metrics_port="" unit_line="" unit_key="" unit_value=""
-    local unit_transport_mode="auto" unit_transport_effective="ws" unit_cf_protocol="quic"
+    local unit_transport_mode="auto" unit_transport_effective="ws" unit_transport_arg="" unit_cf_protocol="quic"
     [[ -s "${ETC_DIR}/env" ]] || err "环境文件不存在或为空，拒绝生成空参数 Systemd 单元"
     while IFS= read -r unit_line || [[ -n "$unit_line" ]]; do
         [[ "$unit_line" =~ ^[[:space:]]*# ]] && continue
@@ -858,6 +866,14 @@ write_units() {
     [[ "$unit_cf_protocol" == "quic" ]] || err "CLOUDFLARED_PROTOCOL 必须为 quic；本最终版固定 VPS 尾程使用 UDP/QUIC"
     unit_transport_mode="$(normalize_transport_mode "${unit_transport_mode:-auto}")" || err "环境文件中的 TRANSPORT_MODE 无效"
     unit_transport_effective="$(resolve_server_transport_mode "$unit_transport_mode")" || err "当前核心无法启用 ${unit_transport_mode}"
+    # V26 WS-LTS 仅暴露 -transport-h2-experimental 等能力探针，不支持通用
+    # -transport。只有帮助文本存在独立 -transport 参数时才写入 ExecStart。
+    if xtunnel_generic_transport_supported; then
+        unit_transport_arg=" -transport ${unit_transport_effective}"
+    else
+        unit_transport_arg=""
+        unit_transport_effective="core-default-ws"
+    fi
     local unit_admission_modes
     unit_admission_modes="$(server_auto_admission_summary)"
     if [[ "$unit_transport_mode" == "auto" ]]; then
@@ -935,11 +951,11 @@ EOF
     # 未导出或仍保留旧值的调用方变量 SECRET。
     if [[ -n "$unit_secret" ]]; then
         cat >> "/etc/systemd/system/${XT_SERVICE}" <<EOF
-ExecStart=${BIN_DIR}/xtunnel -l wss://127.0.0.1:${unit_ws_port} -token "${unit_token}" -f socks5://127.0.0.1:${unit_sb_port} -secret "${unit_secret}" -fallback-proxy "${unit_fallback}" -transport ${unit_transport_effective} -quiet
+ExecStart=${BIN_DIR}/xtunnel -l wss://127.0.0.1:${unit_ws_port} -token "${unit_token}" -f socks5://127.0.0.1:${unit_sb_port} -secret "${unit_secret}" -fallback-proxy "${unit_fallback}"${unit_transport_arg} -quiet
 EOF
     else
         cat >> "/etc/systemd/system/${XT_SERVICE}" <<EOF
-ExecStart=${BIN_DIR}/xtunnel -l wss://127.0.0.1:${unit_ws_port} -token "${unit_token}" -f socks5://127.0.0.1:${unit_sb_port} -fallback-proxy "${unit_fallback}" -transport ${unit_transport_effective} -quiet
+ExecStart=${BIN_DIR}/xtunnel -l wss://127.0.0.1:${unit_ws_port} -token "${unit_token}" -f socks5://127.0.0.1:${unit_sb_port} -fallback-proxy "${unit_fallback}"${unit_transport_arg} -quiet
 EOF
     fi
     cat >> "/etc/systemd/system/${XT_SERVICE}" <<EOF
